@@ -11,10 +11,11 @@
 #   HERALD_PI_WORKDIR      working dir for pi (default: $HOME)
 set -uo pipefail
 
-# Resolve `herald` relative to this script (bin/.. holds the binary), so the
-# bridge works under systemd where PATH is minimal.
+# systemd user services start with a minimal PATH that omits the herald binary
+# (repo dir) and user-installed tools like pi (~/.local/bin). Prepend them so
+# both resolve.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PATH="$SCRIPT_DIR/..:$PATH"
+export PATH="$SCRIPT_DIR/..:$HOME/.local/bin:$HOME/.local/go/bin:$HOME/go/bin:$PATH"
 
 S="${HERALD_PI_SESSION_DIR:-$HOME/.herald/pi-sessions}"
 W="${HERALD_PI_WORKDIR:-$HOME}"
