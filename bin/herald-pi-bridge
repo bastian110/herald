@@ -41,12 +41,15 @@ send() {
   done
 }
 
+# pi reads stdin when it is not a TTY (the `cat file | pi -p` pattern). Here pi
+# would inherit the socket stream as stdin and block forever waiting for EOF, so
+# redirect its stdin from /dev/null.
 run_pi() {
   local prompt="$1"
   if [[ -f "$ACTIVE" ]]; then
-    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -c -p "$prompt" 2>&1)
+    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -c -p "$prompt" </dev/null 2>&1)
   else
-    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -p "$prompt" 2>&1)
+    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -p "$prompt" </dev/null 2>&1)
     : > "$ACTIVE"
   fi
 }
