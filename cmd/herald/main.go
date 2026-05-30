@@ -1,56 +1,52 @@
 package main
 
 import (
-	"context"
-	"log"
+	"fmt"
 	"os"
-	"os/signal"
-	"strconv"
-	"syscall"
 )
 
 func main() {
-	token := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if token == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN is required")
+	os.Exit(dispatch(os.Args[1:]))
+}
+
+func dispatch(args []string) int {
+	if len(args) == 0 {
+		usage()
+		return 2
 	}
-
-	cfg := Config{
-		Token:         token,
-		SocketPath:    envOrDefault("HERALD_SOCKET", "/tmp/herald.sock"),
-		PollTimeout:   envInt("HERALD_POLL_TIMEOUT", 30),
-		DefaultChatID: envInt64("HERALD_CHAT_ID", 0),
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	if err := run(ctx, cfg); err != nil {
-		log.Fatal(err)
+	switch args[0] {
+	case "serve":
+		return serveCmd(args[1:])
+	case "send":
+		return sendCmd(args[1:])
+	case "recv":
+		return recvCmd(args[1:])
+	case "-h", "--help", "help":
+		usage()
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "herald: unknown command %q\n\n", args[0])
+		usage()
+		return 2
 	}
 }
 
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+func usage() {
+	fmt.Fprint(os.Stderr, `herald — Telegram <-> harness bridge
+
+Usage:
+  herald serve                       run the daemon
+  herald send [--chat-id N] <text>   send a message
+  herald recv [--follow] [--json] [--timeout S]
+                                     receive inbound message(s)
+
+Env: TELEGRAM_BOT_TOKEN, HERALD_SOCKET, HERALD_POLL_TIMEOUT, HERALD_CHAT_ID
+`)
+}
+
+func socketPath() string {
+	if v := os.Getenv("HERALD_SOCKET"); v != "" {
 		return v
 	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-func envInt64(key string, def int64) int64 {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
-	}
-	return def
+	return "/tmp/herald.sock"
 }

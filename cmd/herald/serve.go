@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 
 	"github.com/bastian110/herald/internal/protocol"
 	"github.com/bastian110/herald/internal/router"
@@ -13,14 +17,33 @@ import (
 // Config holds the daemon's runtime configuration.
 type Config struct {
 	Token         string
-	BaseURL       string // Telegram API base; "" uses the real api.telegram.org
+	BaseURL       string
 	SocketPath    string
 	PollTimeout   int
 	DefaultChatID int64
 }
 
-// run wires the Telegram client/poller, the broadcast router, and the socket
-// server together, blocking until ctx is cancelled or the socket server errors.
+func serveCmd(args []string) int {
+	token := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if token == "" {
+		log.Println("TELEGRAM_BOT_TOKEN is required")
+		return 1
+	}
+	cfg := Config{
+		Token:         token,
+		SocketPath:    envOrDefault("HERALD_SOCKET", "/tmp/herald.sock"),
+		PollTimeout:   envInt("HERALD_POLL_TIMEOUT", 30),
+		DefaultChatID: envInt64("HERALD_CHAT_ID", 0),
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, cfg); err != nil {
+		log.Println(err)
+		return 1
+	}
+	return 0
+}
+
 func run(ctx context.Context, cfg Config) error {
 	var client *telegram.Client
 	if cfg.BaseURL == "" {
@@ -39,7 +62,6 @@ func run(ctx context.Context, cfg Config) error {
 	}
 
 	srv := socket.New(cfg.SocketPath, r, send)
-
 	updates := make(chan telegram.Update, 32)
 	go poller.Run(ctx, updates)
 	go broadcastUpdates(ctx, updates, r)
@@ -48,8 +70,6 @@ func run(ctx context.Context, cfg Config) error {
 	return srv.Run(ctx)
 }
 
-// broadcastUpdates converts incoming Telegram updates into protocol envelopes
-// and broadcasts them to all connected harnesses until ctx is cancelled.
 func broadcastUpdates(ctx context.Context, updates <-chan telegram.Update, r *router.Router) {
 	for {
 		select {
@@ -83,4 +103,29 @@ func broadcastUpdates(ctx context.Context, updates <-chan telegram.Update, r *ro
 			return
 		}
 	}
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
 }
