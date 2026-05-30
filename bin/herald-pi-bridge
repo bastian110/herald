@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# herald-pi-bridge — drive the `pi` coding agent from Telegram via herald.
+#
+# Holds ONE persistent connection to the herald socket. For each inbound
+# Telegram message it runs `pi` and sends the reply back. The pi conversation
+# is persisted across messages (so context carries over); the special command
+# "/new" resets the agent context only — the Telegram chat is untouched.
+#
+# Session isolation: pi runs against a dedicated session dir, so `pi -c` only
+# ever continues THIS bridge's conversation, never one started elsewhere.
+#
+# Env:
+#   HERALD_SOCKET           Unix socket path (default: /tmp/herald.sock)
+#   HERALD_PI_SESSION_DIR   pi session storage (default: ~/.herald/pi-sessions)
+#   HERALD_PI_WORKDIR       working dir for pi (default: $HOME)
+#   HERALD_PI_ACTIVE        marker file tracking an open session
+#                           (default: $HERALD_PI_SESSION_DIR/.active)
+set -uo pipefail
+
+SOCKET="${HERALD_SOCKET:-/tmp/herald.sock}"
+SESSION_DIR="${HERALD_PI_SESSION_DIR:-$HOME/.herald/pi-sessions}"
+WORKDIR="${HERALD_PI_WORKDIR:-$HOME}"
+ACTIVE="${HERALD_PI_ACTIVE:-$SESSION_DIR/.active}"
+TG_LIMIT=4000   # Telegram caps messages at 4096 chars; stay safely under.
+
+mkdir -p "$SESSION_DIR"
+
+# send TEXT [CHAT_ID] — push a reply back through herald, splitting long output
+# into Telegram-sized chunks.
+send() {
+  local text="$1" chat="${2:-}" chunk payload
+  while [[ -n "$text" ]]; do
+    chunk="${text:0:$TG_LIMIT}"
+    text="${text:$TG_LIMIT}"
+    if [[ -n "$chat" && "$chat" != "null" ]]; then
+      payload=$(jq -nc --arg t "$chunk" --argjson c "$chat" '{op:"send",text:$t,chat_id:$c}')
+    else
+      payload=$(jq -nc --arg t "$chunk" '{op:"send",text:$t}')
+    fi
+    printf '%s\n' "$payload" | socat - "UNIX-CONNECT:$SOCKET" >/dev/null 2>&1
+  done
+}
+
+run_pi() {
+  local prompt="$1"
+  if [[ -f "$ACTIVE" ]]; then
+    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -c -p "$prompt" 2>&1)
+  else
+    (cd "$WORKDIR" && pi --session-dir "$SESSION_DIR" -p "$prompt" 2>&1)
+    : > "$ACTIVE"
+  fi
+}
+
+if [[ ! -S "$SOCKET" ]]; then
+  printf 'herald-pi-bridge: socket not found at %s (is herald running?)\n' "$SOCKET" >&2
+  exit 1
+fi
+
+printf 'herald-pi-bridge: listening on %s (sessions: %s)\n' "$SOCKET" "$SESSION_DIR" >&2
+
+# One persistent read connection — no message is missed while pi is working,
+# because herald buffers up to 16 messages per subscriber.
+socat -u "UNIX-CONNECT:$SOCKET" - | while IFS= read -r line; do
+  op=$(jq -r '.op // empty' <<<"$line" 2>/dev/null) || continue
+  [[ "$op" == "message" ]] || continue
+
+  text=$(jq -r '.text // empty' <<<"$line")
+  chat=$(jq -r '.chat_id // empty' <<<"$line")
+  [[ -n "$text" ]] || continue
+
+  if [[ "$text" == "/new" ]]; then
+    rm -f "$ACTIVE"
+    send "🔄 Nouvelle conversation pi (contexte agent reset)." "$chat"
+    continue
+  fi
+
+  reply=$(run_pi "$text")
+  [[ -n "$reply" ]] || reply="(pi: réponse vide)"
+  send "$reply" "$chat"
+done

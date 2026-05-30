@@ -1,0 +1,24 @@
+# systemd user service for the herald → pi bridge.
+#
+# Requires the herald daemon to be running (see herald.service).
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/herald-pi-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herald-pi-bridge
+#
+# Logs:  journalctl --user -u herald-pi-bridge -f
+[Unit]
+Description=herald → pi bridge (drive the pi agent from Telegram)
+After=herald.service
+Wants=herald.service
+
+[Service]
+Type=simple
+ExecStart=%h/Projects/herald/bin/herald-pi-bridge
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

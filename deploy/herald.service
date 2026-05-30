@@ -1,0 +1,26 @@
+# systemd user service for the herald daemon.
+#
+# Install:
+#   cd ~/Projects/herald && go build -o herald ./cmd/herald
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/herald.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now herald
+#   loginctl enable-linger "$USER"        # keep it running after logout / on boot
+#
+# Logs:  journalctl --user -u herald -f
+[Unit]
+Description=herald — Telegram <-> harness bridge daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/herald
+EnvironmentFile=%h/Projects/herald/.env
+ExecStart=%h/Projects/herald/herald
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

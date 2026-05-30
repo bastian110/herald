@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# herald-send — send a message to Telegram via the herald daemon.
+#
+# Usage:
+#   herald-send "your message"            # send to the daemon's default chat
+#   herald-send "your message" 123456     # send to a specific chat_id
+#
+# Env:
+#   HERALD_SOCKET   Unix socket path (default: /tmp/herald.sock)
+#
+# Exits 0 on ack, 1 on error or if the daemon is unreachable.
+set -euo pipefail
+
+SOCKET="${HERALD_SOCKET:-/tmp/herald.sock}"
+
+if [[ $# -lt 1 || -z "${1:-}" ]]; then
+  printf 'Usage: %s "message" [chat_id]\n' "$(basename "$0")" >&2
+  exit 2
+fi
+
+text="$1"
+chat="${2:-}"
+
+if [[ ! -S "$SOCKET" ]]; then
+  printf 'herald-send: daemon socket not found at %s (is herald running?)\n' "$SOCKET" >&2
+  exit 1
+fi
+
+if [[ -n "$chat" ]]; then
+  payload=$(jq -nc --arg t "$text" --argjson c "$chat" '{op:"send",text:$t,chat_id:$c}')
+else
+  payload=$(jq -nc --arg t "$text" '{op:"send",text:$t}')
+fi
+
+# Send the line; herald replies with one ack/error line then closes on our EOF.
+ack=$(printf '%s\n' "$payload" | socat - "UNIX-CONNECT:$SOCKET")
+
+if [[ "$(jq -r '.op // empty' <<<"$ack" 2>/dev/null)" == "ack" ]]; then
+  exit 0
+fi
+
+printf 'herald-send: %s\n' "$(jq -r '.message // "unknown error"' <<<"$ack" 2>/dev/null)" >&2
+exit 1
