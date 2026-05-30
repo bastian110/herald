@@ -18,7 +18,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/Projects/herald
 EnvironmentFile=%h/Projects/herald/.env
-ExecStart=%h/Projects/herald/herald
+ExecStart=%h/Projects/herald/herald serve
 Restart=on-failure
 RestartSec=3
 

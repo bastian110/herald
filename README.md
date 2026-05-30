@@ -19,8 +19,8 @@ Harnesses connect to a Unix socket and exchange newline-delimited JSON. Herald l
                                                   ▲ (newline-delimited JSON)
                        ┌──────────────────────────┼──────────────────────────┐
                        │                          │                          │
-                  herald-send               herald-recv              herald-pi-bridge
-                  (notify, 1-shot)          (read, 1-shot)           (persistent: recv→pi→send)
+                 herald send                herald recv              herald-pi-bridge
+                 (notify, 1-shot)           (read; --follow streams) (persistent: recv→pi→send)
                                                                             │
                                                                        pi -p "…"
 ```
@@ -29,11 +29,13 @@ Harnesses connect to a Unix socket and exchange newline-delimited JSON. Herald l
 
 | Layer | Component | Responsibility |
 |-------|-----------|----------------|
-| Daemon | `herald` (Go) | Long-poll Telegram, broadcast inbound to all listeners, forward outbound. Pure transport — knows nothing about agents. |
-| Wrappers | `herald-send` / `herald-recv` | One-shot primitives hiding the raw socket + JSON. For notifications and simple scripts. |
-| Bridge | `herald-pi-bridge` | Persistent listener that drives an agent (`pi`): `recv → pi → send`, with session persistence and `/new` reset. |
+| Daemon | `herald serve` | Long-poll Telegram, broadcast inbound to all listeners, forward outbound. Pure transport — knows nothing about agents. |
+| Primitives | `herald send` / `herald recv` | Binary subcommands hiding the raw socket + JSON. For notifications and as building blocks for bridges. No `socat`/`jq` needed. |
+| Bridge | `herald-pi-bridge` | Harness-specific listener that drives an agent (`pi`): `recv → pi → send`, with session persistence and `/new` reset. |
 
-Internally the daemon is four focused Go packages: `internal/telegram` (poller + client), `internal/router` (broadcast fan-out), `internal/socket` (Unix socket server), `internal/protocol` (JSON envelope). `cmd/herald` wires them together.
+One Go binary carries everything generic (`serve`/`send`/`recv`); each **bridge stays specific to its harness** but is a trivial script over `herald recv --follow` + `herald send`.
+
+Internally the daemon is five focused Go packages: `internal/telegram` (poller + client), `internal/router` (broadcast fan-out), `internal/socket` (Unix socket server), `internal/protocol` (JSON envelope), `internal/client` (socket primitives for the subcommands). `cmd/herald` dispatches the subcommands.
 
 **Message flows:**
 - *Outbound* — harness writes `{"op":"send",…}` → socket server → telegram client `sendMessage` → ack back to that harness.
@@ -60,9 +62,10 @@ $EDITOR .env        # set TELEGRAM_BOT_TOKEN and HERALD_CHAT_ID
 
 ```bash
 go build -o herald ./cmd/herald
-set -a && . ./.env && set +a    # load .env into the environment
-./herald &                       # 1. start the daemon
-bin/herald-pi-bridge &           # 2. (optional) start the pi bridge
+export PATH="$PWD:$PWD/bin:$PATH"   # so `herald` and the bridge are on PATH
+set -a && . ./.env && set +a        # load .env into the environment
+herald serve &                       # 1. start the daemon
+herald-pi-bridge &                   # 2. (optional) start the pi bridge
 ```
 
 > ⚠️ Run **exactly one** `herald` instance per bot token. Two daemons both
@@ -122,52 +125,40 @@ Newline-delimited JSON over the Unix socket.
 {"op":"error","message":"telegram sendMessage: HTTP 404"}
 ```
 
-## Connecting
-
-**socat:**
-```bash
-echo '{"op":"send","text":"hello"}' | socat - UNIX-CONNECT:/tmp/herald.sock   # send
-socat - UNIX-CONNECT:/tmp/herald.sock                                         # listen
-```
-
-**Python:**
-```python
-import socket, json
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("/tmp/herald.sock")
-s.sendall(json.dumps({"op": "send", "text": "hello"}).encode() + b"\n")
-print(s.recv(4096))
-```
-
 ## Connecting a harness
 
-Herald is just transport. Two layers sit on top:
+Herald is just transport. The binary's `send`/`recv` subcommands are the
+primitives; a harness-specific bridge sits on top.
 
-```
-wrappers   send one / receive one          (bin/herald-send, bin/herald-recv)
-bridge     persistent recv → agent → send  (bin/herald-pi-bridge)
-```
+### Primitives (subcommands)
 
-### Wrappers (primitives)
-
-Drop-in helpers that hide the raw socket + JSON. Add `bin/` to your `PATH`.
+No `socat`/`jq` — the binary speaks the protocol itself.
 
 ```bash
-herald-send "build finished ✅"        # notify the default chat
-herald-send "done" 123456              # notify a specific chat_id
-text=$(herald-recv)                     # block for the next inbound message
-json=$(herald-recv --json)              # raw envelope (text + from + chat_id)
-herald-recv --timeout 60                # give up after 60s (exit 1)
+herald send "build finished ✅"        # notify the default chat
+herald send --chat-id 123456 "done"    # notify a specific chat_id
+text=$(herald recv)                     # block for the next inbound message
+herald recv --json                      # raw envelope (text + from + chat_id)
+herald recv --timeout 60                # give up after 60s (exit 1)
+herald recv --follow                    # stream every message (for bridges)
 ```
 
-Use the wrappers for one-shot notifications. They open a fresh connection per
-call, so messages arriving between calls are not buffered — for a durable
-listener, hold one persistent connection (that is what the bridge does).
+`herald recv` (one-shot) opens a fresh connection per call, so messages arriving
+between calls are not buffered. A durable listener holds **one** connection with
+`herald recv --follow` — that is what a bridge does.
 
 ### Bridge (drive an agent from Telegram)
 
-`bin/herald-pi-bridge` holds one persistent connection and, for each inbound
-message, runs the [`pi`](https://pi.dev) agent and sends the reply back:
+`bin/herald-pi-bridge` follows the stream and, for each inbound message, runs the
+[`pi`](https://pi.dev) agent and sends the reply back — the whole bridge is three
+lines over the primitives:
+
+```bash
+herald recv --follow | while IFS= read -r text; do
+  reply=$(pi --session-dir "$S" -c -p "$text" </dev/null 2>&1)
+  herald send "$reply"
+done
+```
 
 ```
 User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
@@ -181,17 +172,31 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
 - pi runs **on demand** (one process per message); only herald runs continuously.
 
 ```bash
-./herald &              # daemon must be running first
-bin/herald-pi-bridge    # then start the bridge
+herald serve &           # daemon must be running first
+herald-pi-bridge         # then start the bridge
 ```
 
 > Herald broadcasts every inbound message to **all** connected listeners, so run
 > **one** bridge (= one responding agent) at a time. Driving several agents would
 > need message routing (e.g. a `/pi` vs `/claude` prefix) — not implemented yet.
 
-Writing a bridge for another harness is the same shape: read envelopes from the
-socket, run your agent, `herald-send` the reply. systemd user units for both the
-daemon and the bridge live in `deploy/` — see [Startup commands](#startup-commands).
+Writing a bridge for another harness is the same shape: `herald recv --follow` →
+run your agent → `herald send`. The bridge stays specific to that harness's
+commands; only the plumbing is shared. systemd user units for both the daemon and
+the bridge live in `deploy/` — see [Startup commands](#startup-commands).
+
+### Raw protocol (any language)
+
+The wire format is newline-delimited JSON on the Unix socket, so anything can
+speak it directly:
+
+```python
+import socket, json
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/herald.sock")
+s.sendall(json.dumps({"op": "send", "text": "hello"}).encode() + b"\n")
+print(s.recv(4096))
+```
 
 ## Test
 
