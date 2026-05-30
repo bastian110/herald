@@ -4,19 +4,89 @@ A standalone Unix socket daemon that bridges AI harnesses to messaging platforms
 
 Harnesses connect to a Unix socket and exchange newline-delimited JSON. Herald long-polls Telegram for incoming messages and broadcasts them to all connected harnesses; outbound messages from any harness are forwarded to Telegram.
 
+## Architecture
+
+```
+                          ┌──────────────────────────────────────────┐
+                          │                 herald                    │
+   Telegram Bot API       │  ┌──────────┐   ┌────────┐   ┌─────────┐  │
+  ┌──────────────┐        │  │ telegram │──▶│ router │──▶│ socket  │  │
+  │  getUpdates  │◀───────┼──│  poller  │   │ (fan-  │   │ server  │  │
+  │  sendMessage │───────▶│  │  client  │◀──│  out)  │◀──│         │  │
+  └──────────────┘        │  └──────────┘   └────────┘   └────┬────┘  │
+                          └────────────────────────────────────┼──────┘
+                                          /tmp/herald.sock  ◀───┘
+                                                  ▲ (newline-delimited JSON)
+                       ┌──────────────────────────┼──────────────────────────┐
+                       │                          │                          │
+                  herald-send               herald-recv              herald-pi-bridge
+                  (notify, 1-shot)          (read, 1-shot)           (persistent: recv→pi→send)
+                                                                            │
+                                                                       pi -p "…"
+```
+
+**Three layers, each with one job:**
+
+| Layer | Component | Responsibility |
+|-------|-----------|----------------|
+| Daemon | `herald` (Go) | Long-poll Telegram, broadcast inbound to all listeners, forward outbound. Pure transport — knows nothing about agents. |
+| Wrappers | `herald-send` / `herald-recv` | One-shot primitives hiding the raw socket + JSON. For notifications and simple scripts. |
+| Bridge | `herald-pi-bridge` | Persistent listener that drives an agent (`pi`): `recv → pi → send`, with session persistence and `/new` reset. |
+
+Internally the daemon is four focused Go packages: `internal/telegram` (poller + client), `internal/router` (broadcast fan-out), `internal/socket` (Unix socket server), `internal/protocol` (JSON envelope). `cmd/herald` wires them together.
+
+**Message flows:**
+- *Outbound* — harness writes `{"op":"send",…}` → socket server → telegram client `sendMessage` → ack back to that harness.
+- *Inbound* — poller `getUpdates` → router broadcasts `{"op":"message",…}` to every connected listener.
+
+> Herald broadcasts every inbound message to **all** listeners, so run **one** responding bridge at a time. Multiple agents would need routing (e.g. a `/pi` vs `/claude` prefix) — not implemented yet.
+
 ## Build
 
 ```bash
 go build -o herald ./cmd/herald
 ```
 
-## Run
+## Startup commands
+
+Configure once — copy `.env.example` to `.env` and fill in your token + chat_id:
 
 ```bash
-export TELEGRAM_BOT_TOKEN=<token-from-@BotFather>
-export HERALD_CHAT_ID=<your-chat-id>   # default chat for sends without an explicit chat_id
-./herald
+cp .env.example .env
+$EDITOR .env        # set TELEGRAM_BOT_TOKEN and HERALD_CHAT_ID
 ```
+
+**Manual run (dev / one-off):**
+
+```bash
+go build -o herald ./cmd/herald
+set -a && . ./.env && set +a    # load .env into the environment
+./herald &                       # 1. start the daemon
+bin/herald-pi-bridge &           # 2. (optional) start the pi bridge
+```
+
+> ⚠️ Run **exactly one** `herald` instance per bot token. Two daemons both
+> long-poll the same bot and steal each other's updates. The systemd unit below
+> enforces this — prefer it for anything long-running.
+
+**Service run (recommended, survives logout + boot):**
+
+```bash
+go build -o herald ./cmd/herald
+mkdir -p ~/.config/systemd/user
+cp deploy/herald.service deploy/herald-pi-bridge.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now herald herald-pi-bridge
+loginctl enable-linger "$USER"
+
+# manage / observe
+systemctl --user status herald herald-pi-bridge
+journalctl --user -u herald -f
+systemctl --user restart herald          # after rebuilding the binary
+systemctl --user stop herald herald-pi-bridge
+```
+
+**Environment variables** (read from `.env` by both the binary and the systemd unit):
 
 | Variable | Default | Description |
 |---|---|---|
@@ -24,6 +94,13 @@ export HERALD_CHAT_ID=<your-chat-id>   # default chat for sends without an expli
 | `HERALD_SOCKET` | `/tmp/herald.sock` | Unix socket path |
 | `HERALD_POLL_TIMEOUT` | `30` | Telegram long-poll timeout (seconds) |
 | `HERALD_CHAT_ID` | `0` | Default chat_id for sends with no explicit chat_id |
+
+Bridge-only variables (`herald-pi-bridge`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `HERALD_PI_SESSION_DIR` | `~/.herald/pi-sessions` | Isolated pi session storage (keeps `pi -c` scoped to the bridge) |
+| `HERALD_PI_WORKDIR` | `$HOME` | Working directory pi runs in |
 
 ## Protocol
 
@@ -113,21 +190,8 @@ bin/herald-pi-bridge    # then start the bridge
 > need message routing (e.g. a `/pi` vs `/claude` prefix) — not implemented yet.
 
 Writing a bridge for another harness is the same shape: read envelopes from the
-socket, run your agent, `herald-send` the reply.
-
-## Running as a service
-
-systemd user units live in `deploy/`:
-
-```bash
-go build -o herald ./cmd/herald
-mkdir -p ~/.config/systemd/user
-cp deploy/herald.service deploy/herald-pi-bridge.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now herald herald-pi-bridge
-loginctl enable-linger "$USER"          # survive logout / start on boot
-journalctl --user -u herald -f          # logs
-```
+socket, run your agent, `herald-send` the reply. systemd user units for both the
+daemon and the bridge live in `deploy/` — see [Startup commands](#startup-commands).
 
 ## Test
 
