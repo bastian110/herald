@@ -9,6 +9,10 @@
 #   HERALD_SOCKET          socket path (default: /tmp/herald.sock)
 #   HERALD_PI_SESSION_DIR  pi session storage (default: ~/.herald/pi-sessions)
 #   HERALD_PI_WORKDIR      working dir for pi (default: $HOME)
+#   HERALD_PI_LOCK_FILE    single-run lock path (default: /tmp/herald-pi-bridge.lock)
+#   HERALD_WHISPER_ROOT    whisper.cpp install root (default: ~/projects/oss/whisper.cpp)
+#   HERALD_WHISPER_MODEL   whisper model path (default: $HERALD_WHISPER_ROOT/models/ggml-base.bin)
+#   HERALD_PI_VOICE_LANG   whisper language (default: auto)
 set -uo pipefail
 
 # systemd user services start with a minimal PATH that omits the herald binary
@@ -19,18 +23,120 @@ export PATH="$SCRIPT_DIR/..:$HOME/.local/bin:$HOME/.local/go/bin:$HOME/go/bin:$P
 
 S="${HERALD_PI_SESSION_DIR:-$HOME/.herald/pi-sessions}"
 W="${HERALD_PI_WORKDIR:-$HOME}"
+L="${HERALD_PI_LOCK_FILE:-/tmp/herald-pi-bridge.lock}"
+WHISPER_ROOT="${HERALD_WHISPER_ROOT:-$HOME/projects/oss/whisper.cpp}"
+WHISPER_MODEL="${HERALD_WHISPER_MODEL:-$WHISPER_ROOT/models/ggml-base.bin}"
+WHISPER_CLI="$WHISPER_ROOT/build/bin/whisper-cli"
+VOICE_LANG="${HERALD_PI_VOICE_LANG:-auto}"
 mkdir -p "$S"
+
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$L"
+  if ! flock -n 9; then
+    echo "herald-pi-bridge: another bridge is already running (lock: $L)" >&2
+    exit 0
+  fi
+else
+  LOCK_DIR="${L}.d"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "herald-pi-bridge: another bridge is already running (lock: $LOCK_DIR)" >&2
+    exit 0
+  fi
+  trap 'rmdir "$LOCK_DIR"' EXIT INT TERM
+fi
+
+telegram_get_file_path() {
+  local file_id="$1"
+  curl -fsSL "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${file_id}" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("result", {}).get("file_path", ""))'
+}
+
+transcribe_voice() {
+  local input="$1"
+  if [[ ! -x "$WHISPER_CLI" || ! -f "$WHISPER_MODEL" ]]; then
+    echo "whisper unavailable: $WHISPER_CLI / $WHISPER_MODEL" >&2
+    return 1
+  fi
+  if [[ "$VOICE_LANG" == "auto" ]]; then
+    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$input" -l auto -nt -np
+  else
+    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$input" -l "$VOICE_LANG" -nt -np
+  fi
+}
+
+reset_pi_session() {
+  find "$S" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+}
 
 echo "herald-pi-bridge: listening (sessions: $S)" >&2
 
-herald recv --follow | while IFS= read -r text; do
-  [[ -n "$text" ]] || continue
-  if [[ "$text" == "/new" ]]; then
-    rm -rf "${S:?}"/* 2>/dev/null
-    herald send "🔄 Nouvelle conversation pi (contexte agent reset)."
+herald recv --follow --json | while IFS= read -r raw; do
+  [[ -n "$raw" ]] || continue
+  eval "$(python3 - "$raw" <<'PY'
+import json, shlex, sys
+m = json.loads(sys.argv[1])
+fields = {
+    'KIND': m.get('kind', 'text') or 'text',
+    'TEXT': m.get('text', '') or '',
+    'CHAT_ID': str(m.get('chat_id', '') or ''),
+    'FILE_ID': m.get('file_id', '') or '',
+    'MIME_TYPE': m.get('mime_type', '') or '',
+}
+for k, v in fields.items():
+    print(f"{k}={shlex.quote(v)}")
+PY
+)"
+
+  prompt="$TEXT"
+  if [[ "$KIND" == "voice" ]]; then
+    if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+      herald send --chat-id "$CHAT_ID" "⚠️ Vocal reçu, mais TELEGRAM_BOT_TOKEN manque côté bridge."
+      continue
+    fi
+    file_path="$(telegram_get_file_path "$FILE_ID")"
+    if [[ -z "$file_path" ]]; then
+      herald send --chat-id "$CHAT_ID" "⚠️ Impossible de récupérer le fichier vocal Telegram."
+      continue
+    fi
+    tmp_voice="$(mktemp /tmp/herald-voice-XXXXXX.ogg)"
+    tmp_err="$(mktemp /tmp/herald-whisper-XXXXXX.log)"
+    if ! curl -fsSL "https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file_path}" -o "$tmp_voice"; then
+      rm -f "$tmp_voice" "$tmp_err"
+      herald send --chat-id "$CHAT_ID" "⚠️ Échec téléchargement du vocal Telegram."
+      continue
+    fi
+    transcript=""
+    if ! transcript="$(transcribe_voice "$tmp_voice" 2>"$tmp_err")"; then
+      rm -f "$tmp_voice"
+      err_msg="$(tr '\n' ' ' < "$tmp_err")"
+      rm -f "$tmp_err"
+      [[ -n "$err_msg" ]] || err_msg="échec transcription"
+      herald send --chat-id "$CHAT_ID" "⚠️ Transcription vocal impossible: $err_msg"
+      continue
+    fi
+    rm -f "$tmp_voice" "$tmp_err"
+    if [[ -z "$transcript" ]]; then
+      herald send --chat-id "$CHAT_ID" "⚠️ Échec transcription du vocal."
+      continue
+    fi
+    if [[ -n "$prompt" ]]; then
+      prompt="$prompt
+
+Transcription du vocal Telegram:
+$transcript"
+    else
+      prompt="Transcription du vocal Telegram:
+$transcript"
+    fi
+  fi
+
+  [[ -n "$prompt" ]] || continue
+  if [[ "$prompt" == "/new" ]]; then
+    reset_pi_session
+    herald send --chat-id "$CHAT_ID" "🔄 Nouvelle conversation pi (contexte agent reset)."
     continue
   fi
-  reply=$(cd "$W" && pi --session-dir "$S" -c -p "$text" </dev/null 2>&1)
+  reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
   [[ -n "$reply" ]] || reply="(pi: réponse vide)"
-  herald send "$reply"
+  herald send --chat-id "$CHAT_ID" "$reply"
 done

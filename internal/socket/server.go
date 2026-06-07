@@ -72,6 +72,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 
 	// Read outbound send ops from this harness.
 	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // 4 MB max: handles long pi replies
 	for scanner.Scan() {
 		var env protocol.Envelope
 		if err := json.Unmarshal(scanner.Bytes(), &env); err != nil {

@@ -77,7 +77,7 @@ func broadcastUpdates(ctx context.Context, updates <-chan telegram.Update, r *ro
 			if !ok {
 				return
 			}
-			if u.Message == nil || u.Message.Text == "" {
+			if u.Message == nil {
 				continue
 			}
 			from := ""
@@ -89,9 +89,19 @@ func broadcastUpdates(ctx context.Context, updates <-chan telegram.Update, r *ro
 			}
 			env := protocol.Envelope{
 				Op:     "message",
+				Kind:   "text",
 				Text:   u.Message.Text,
 				From:   from,
 				ChatID: u.Message.Chat.ID,
+			}
+			if u.Message.Text == "" {
+				if u.Message.Voice == nil || u.Message.Voice.FileID == "" {
+					continue
+				}
+				env.Kind = "voice"
+				env.Text = u.Message.Caption
+				env.FileID = u.Message.Voice.FileID
+				env.MimeType = u.Message.Voice.MimeType
 			}
 			b, err := protocol.Encode(env)
 			if err != nil {

@@ -48,3 +48,33 @@ func TestSendMessageReturnsErrorOnNon200(t *testing.T) {
 		t.Fatal("expected error for 401 response")
 	}
 }
+
+func TestSendMessageSplitsLongText(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, body["text"].(string))
+		json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+	defer srv.Close()
+
+	client := telegram.NewClientWithBase("tok", srv.URL)
+	msg := "line1\nline2\né"
+	for len([]rune(msg)) <= 4096 {
+		msg += "x"
+	}
+	if err := client.SendMessage(7, msg); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 2 {
+		t.Fatalf("want split into multiple chunks, got %d", len(got))
+	}
+	for i, chunk := range got {
+		if len([]rune(chunk)) > 4096 {
+			t.Fatalf("chunk %d too long: %d runes", i, len([]rune(chunk)))
+		}
+	}
+}

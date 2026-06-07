@@ -18,8 +18,16 @@ type Update struct {
 type Message struct {
 	MessageID int    `json:"message_id"`
 	Text      string `json:"text"`
+	Caption   string `json:"caption,omitempty"`
 	Chat      Chat   `json:"chat"`
 	From      *User  `json:"from,omitempty"`
+	Voice     *Voice `json:"voice,omitempty"`
+}
+
+// Voice holds Telegram voice-note metadata.
+type Voice struct {
+	FileID   string `json:"file_id"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
 // Chat holds the chat ID.

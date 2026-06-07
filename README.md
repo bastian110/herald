@@ -104,6 +104,10 @@ Bridge-only variables (`herald-pi-bridge`):
 |---|---|---|
 | `HERALD_PI_SESSION_DIR` | `~/.herald/pi-sessions` | Isolated pi session storage (keeps `pi -c` scoped to the bridge) |
 | `HERALD_PI_WORKDIR` | `$HOME` | Working directory pi runs in |
+| `HERALD_PI_LOCK_FILE` | `/tmp/herald-pi-bridge.lock` | Process lock so only one responding pi bridge runs |
+| `HERALD_WHISPER_ROOT` | `~/projects/oss/whisper.cpp` | whisper.cpp install root used for Telegram voice notes |
+| `HERALD_WHISPER_MODEL` | `$HERALD_WHISPER_ROOT/models/ggml-base.bin` | Whisper model path |
+| `HERALD_PI_VOICE_LANG` | `auto` | Whisper language override for voice note transcription |
 
 ## Protocol
 
@@ -169,6 +173,8 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
   own conversation.
 - Sending **`/new`** from Telegram resets the agent context only — the Telegram
   chat itself is untouched.
+- Telegram **voice notes** are downloaded, transcribed with `whisper.cpp`, then
+  appended to the prompt before `pi` runs.
 - pi runs **on demand** (one process per message); only herald runs continuously.
 
 ```bash
@@ -179,6 +185,9 @@ herald-pi-bridge         # then start the bridge
 > Herald broadcasts every inbound message to **all** connected listeners, so run
 > **one** bridge (= one responding agent) at a time. Driving several agents would
 > need message routing (e.g. a `/pi` vs `/claude` prefix) — not implemented yet.
+> `herald-pi-bridge` also takes a process lock and exits if another copy is
+> already running, which prevents duplicate agent replies from accidental double
+> starts.
 
 Writing a bridge for another harness is the same shape: `herald recv --follow` →
 run your agent → `herald send`. The bridge stays specific to that harness's
