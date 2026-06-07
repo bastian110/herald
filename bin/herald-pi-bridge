@@ -53,15 +53,31 @@ telegram_get_file_path() {
 
 transcribe_voice() {
   local input="$1"
+  local tmp_wav
+  tmp_wav="$(mktemp /tmp/herald-voice-XXXXXX.wav)"
   if [[ ! -x "$WHISPER_CLI" || ! -f "$WHISPER_MODEL" ]]; then
     echo "whisper unavailable: $WHISPER_CLI / $WHISPER_MODEL" >&2
+    rm -f "$tmp_wav"
+    return 1
+  fi
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "ffmpeg unavailable" >&2
+    rm -f "$tmp_wav"
+    return 1
+  fi
+  if ! ffmpeg -y -i "$input" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp_wav" >/dev/null 2>&1; then
+    echo "ffmpeg decode failed: $input" >&2
+    rm -f "$tmp_wav"
     return 1
   fi
   if [[ "$VOICE_LANG" == "auto" ]]; then
-    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$input" -l auto -nt -np
+    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$tmp_wav" -l auto -nt -np
   else
-    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$input" -l "$VOICE_LANG" -nt -np
+    "$WHISPER_CLI" -m "$WHISPER_MODEL" -f "$tmp_wav" -l "$VOICE_LANG" -nt -np
   fi
+  local rc=$?
+  rm -f "$tmp_wav"
+  return $rc
 }
 
 reset_pi_session() {
