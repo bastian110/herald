@@ -16,6 +16,8 @@ Wants=herald.service
 
 [Service]
 Type=simple
+WorkingDirectory=%h/Projects/herald
+EnvironmentFile=%h/Projects/herald/.env
 ExecStart=%h/Projects/herald/bin/herald-pi-bridge
 Restart=on-failure
 RestartSec=3
