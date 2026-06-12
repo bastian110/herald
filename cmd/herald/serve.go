@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/bastian110/herald/internal/protocol"
 	"github.com/bastian110/herald/internal/router"
@@ -70,49 +71,146 @@ func run(ctx context.Context, cfg Config) error {
 	return srv.Run(ctx)
 }
 
+const imageAlbumFlushDelay = 1500 * time.Millisecond
+
+type imageAlbum struct {
+	env   protocol.Envelope
+	timer *time.Timer
+}
+
 func broadcastUpdates(ctx context.Context, updates <-chan telegram.Update, r *router.Router) {
+	albums := map[string]*imageAlbum{}
+	flushes := make(chan string, 32)
+
+	flushAlbum := func(key string) {
+		album := albums[key]
+		if album == nil {
+			return
+		}
+		delete(albums, key)
+		if album.timer != nil {
+			album.timer.Stop()
+		}
+		broadcastEnvelope(album.env, r)
+	}
+
+	flushAllAlbums := func() {
+		for key := range albums {
+			flushAlbum(key)
+		}
+	}
+
 	for {
 		select {
+		case key := <-flushes:
+			flushAlbum(key)
 		case u, ok := <-updates:
 			if !ok {
+				flushAllAlbums()
 				return
 			}
 			if u.Message == nil {
 				continue
 			}
-			from := ""
-			if u.Message.From != nil {
-				from = u.Message.From.Username
-				if from == "" {
-					from = u.Message.From.FirstName
-				}
-			}
-			env := protocol.Envelope{
-				Op:     "message",
-				Kind:   "text",
-				Text:   u.Message.Text,
-				From:   from,
-				ChatID: u.Message.Chat.ID,
-			}
-			if u.Message.Text == "" {
-				if u.Message.Voice == nil || u.Message.Voice.FileID == "" {
-					continue
-				}
-				env.Kind = "voice"
-				env.Text = u.Message.Caption
-				env.FileID = u.Message.Voice.FileID
-				env.MimeType = u.Message.Voice.MimeType
-			}
-			b, err := protocol.Encode(env)
-			if err != nil {
-				log.Printf("encode error: %v", err)
+			env, ok := envelopeFromMessage(u.Message)
+			if !ok {
 				continue
 			}
-			r.Broadcast(b)
+			if env.Kind == "image" && u.Message.MediaGroupID != "" {
+				key := albumKey(u.Message)
+				album := albums[key]
+				if album == nil {
+					env.FileIDs = []string{env.FileID}
+					env.FileID = ""
+					albums[key] = &imageAlbum{
+						env: env,
+						timer: time.AfterFunc(imageAlbumFlushDelay, func() {
+							select {
+							case flushes <- key:
+							case <-ctx.Done():
+							}
+						}),
+					}
+					continue
+				}
+				album.env.FileIDs = append(album.env.FileIDs, env.FileID)
+				if album.env.Text == "" {
+					album.env.Text = env.Text
+				}
+				album.timer.Reset(imageAlbumFlushDelay)
+				continue
+			}
+			broadcastEnvelope(env, r)
 		case <-ctx.Done():
+			flushAllAlbums()
 			return
 		}
 	}
+}
+
+func envelopeFromMessage(message *telegram.Message) (protocol.Envelope, bool) {
+	from := ""
+	if message.From != nil {
+		from = message.From.Username
+		if from == "" {
+			from = message.From.FirstName
+		}
+	}
+	env := protocol.Envelope{
+		Op:     "message",
+		Kind:   "text",
+		Text:   message.Text,
+		From:   from,
+		ChatID: message.Chat.ID,
+	}
+	if message.Text != "" {
+		return env, true
+	}
+	if message.Voice != nil && message.Voice.FileID != "" {
+		env.Kind = "voice"
+		env.Text = message.Caption
+		env.FileID = message.Voice.FileID
+		env.MimeType = message.Voice.MimeType
+		return env, true
+	}
+	if photo := largestPhoto(message.Photo); photo.FileID != "" {
+		env.Kind = "image"
+		env.Text = message.Caption
+		env.FileID = photo.FileID
+		env.MimeType = "image/jpeg"
+		return env, true
+	}
+	return protocol.Envelope{}, false
+}
+
+func albumKey(message *telegram.Message) string {
+	return strconv.FormatInt(message.Chat.ID, 10) + ":" + message.MediaGroupID
+}
+
+func broadcastEnvelope(env protocol.Envelope, r *router.Router) {
+	b, err := protocol.Encode(env)
+	if err != nil {
+		log.Printf("encode error: %v", err)
+		return
+	}
+	r.Broadcast(b)
+}
+
+func largestPhoto(photos []telegram.PhotoSize) telegram.PhotoSize {
+	var largest telegram.PhotoSize
+	for _, photo := range photos {
+		if photo.FileID == "" {
+			continue
+		}
+		if photo.FileSize > largest.FileSize {
+			largest = photo
+			continue
+		}
+		if photo.FileSize == largest.FileSize && photo.Width*photo.Height > largest.Width*largest.Height {
+			largest = photo
+		}
+	}
+	return largest
 }
 
 func envOrDefault(key, def string) string {

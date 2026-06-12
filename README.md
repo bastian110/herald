@@ -175,6 +175,9 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
   chat itself is untouched.
 - Telegram **voice notes** are downloaded, transcribed with `whisper.cpp`, then
   appended to the prompt before `pi` runs.
+- Telegram **photos/images** are downloaded and passed to `pi` as `@image`
+  file arguments, with the caption used as the prompt when present. Telegram
+  albums are buffered briefly, then sent to `pi` in one multi-image prompt.
 - pi runs **on demand** (one process per message); only herald runs continuously.
 
 ```bash

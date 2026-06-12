@@ -16,18 +16,28 @@ type Update struct {
 
 // Message is a Telegram message.
 type Message struct {
-	MessageID int    `json:"message_id"`
-	Text      string `json:"text"`
-	Caption   string `json:"caption,omitempty"`
-	Chat      Chat   `json:"chat"`
-	From      *User  `json:"from,omitempty"`
-	Voice     *Voice `json:"voice,omitempty"`
+	MessageID    int         `json:"message_id"`
+	Text         string      `json:"text"`
+	Caption      string      `json:"caption,omitempty"`
+	Chat         Chat        `json:"chat"`
+	From         *User       `json:"from,omitempty"`
+	Voice        *Voice      `json:"voice,omitempty"`
+	Photo        []PhotoSize `json:"photo,omitempty"`
+	MediaGroupID string      `json:"media_group_id,omitempty"`
 }
 
 // Voice holds Telegram voice-note metadata.
 type Voice struct {
 	FileID   string `json:"file_id"`
 	MimeType string `json:"mime_type,omitempty"`
+}
+
+// PhotoSize holds Telegram photo metadata for one generated size.
+type PhotoSize struct {
+	FileID   string `json:"file_id"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+	FileSize int    `json:"file_size,omitempty"`
 }
 
 // Chat holds the chat ID.

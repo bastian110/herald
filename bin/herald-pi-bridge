@@ -13,6 +13,8 @@
 #   HERALD_WHISPER_ROOT    whisper.cpp install root (default: ~/projects/oss/whisper.cpp)
 #   HERALD_WHISPER_MODEL   whisper model path (default: $HERALD_WHISPER_ROOT/models/ggml-base.bin)
 #   HERALD_PI_VOICE_LANG   whisper language (default: auto)
+#
+# Telegram photos are downloaded and passed to pi as @image file arguments.
 set -uo pipefail
 
 # systemd user services start with a minimal PATH that omits the herald binary
@@ -49,6 +51,30 @@ telegram_get_file_path() {
   local file_id="$1"
   curl -fsSL "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${file_id}" \
     | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("result", {}).get("file_path", ""))'
+}
+
+download_telegram_file() {
+  local file_id="$1"
+  local output="$2"
+  local file_path
+  file_path="$(telegram_get_file_path "$file_id")"
+  if [[ -z "$file_path" ]]; then
+    return 1
+  fi
+  curl -fsSL "https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file_path}" -o "$output"
+}
+
+telegram_file_suffix() {
+  local file_id="$1"
+  local fallback="$2"
+  local file_path suffix
+  file_path="$(telegram_get_file_path "$file_id")"
+  suffix="${file_path##*.}"
+  if [[ -n "$file_path" && "$suffix" != "$file_path" && ${#suffix} -le 5 ]]; then
+    printf '.%s' "$suffix"
+  else
+    printf '.%s' "$fallback"
+  fi
 }
 
 transcribe_voice() {
@@ -96,6 +122,7 @@ fields = {
     'TEXT': m.get('text', '') or '',
     'CHAT_ID': str(m.get('chat_id', '') or ''),
     'FILE_ID': m.get('file_id', '') or '',
+    'FILE_IDS': '\n'.join(m.get('file_ids') or []),
     'MIME_TYPE': m.get('mime_type', '') or '',
 }
 for k, v in fields.items():
@@ -109,14 +136,9 @@ PY
       herald send --chat-id "$CHAT_ID" "⚠️ Vocal reçu, mais TELEGRAM_BOT_TOKEN manque côté bridge."
       continue
     fi
-    file_path="$(telegram_get_file_path "$FILE_ID")"
-    if [[ -z "$file_path" ]]; then
-      herald send --chat-id "$CHAT_ID" "⚠️ Impossible de récupérer le fichier vocal Telegram."
-      continue
-    fi
     tmp_voice="$(mktemp /tmp/herald-voice-XXXXXX.ogg)"
     tmp_err="$(mktemp /tmp/herald-whisper-XXXXXX.log)"
-    if ! curl -fsSL "https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${file_path}" -o "$tmp_voice"; then
+    if ! download_telegram_file "$FILE_ID" "$tmp_voice"; then
       rm -f "$tmp_voice" "$tmp_err"
       herald send --chat-id "$CHAT_ID" "⚠️ Échec téléchargement du vocal Telegram."
       continue
@@ -146,13 +168,49 @@ $transcript"
     fi
   fi
 
-  [[ -n "$prompt" ]] || continue
+  tmp_images=()
+  if [[ "$KIND" == "image" || "$KIND" == "photo" ]]; then
+    if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+      herald send --chat-id "$CHAT_ID" "⚠️ Image reçue, mais TELEGRAM_BOT_TOKEN manque côté bridge."
+      continue
+    fi
+    image_file_ids="$FILE_IDS"
+    if [[ -z "$image_file_ids" ]]; then
+      image_file_ids="$FILE_ID"
+    fi
+    while IFS= read -r image_file_id; do
+      [[ -n "$image_file_id" ]] || continue
+      suffix="$(telegram_file_suffix "$image_file_id" "jpg")"
+      tmp_image="$(mktemp "/tmp/herald-image-XXXXXX${suffix}")"
+      if ! download_telegram_file "$image_file_id" "$tmp_image"; then
+        rm -f "${tmp_images[@]}" "$tmp_image"
+        herald send --chat-id "$CHAT_ID" "⚠️ Échec téléchargement d'une image Telegram."
+        continue 2
+      fi
+      tmp_images+=("$tmp_image")
+    done <<< "$image_file_ids"
+    if [[ -z "$prompt" ]]; then
+      prompt="Image Telegram jointe. Décris-la ou réponds à partir de son contenu."
+    fi
+  fi
+
+  [[ -n "$prompt" || ${#tmp_images[@]} -gt 0 ]] || continue
   if [[ "$prompt" == "/new" ]]; then
+    rm -f "${tmp_images[@]}"
     reset_pi_session
     herald send --chat-id "$CHAT_ID" "🔄 Nouvelle conversation pi (contexte agent reset)."
     continue
   fi
-  reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
+  if [[ ${#tmp_images[@]} -gt 0 ]]; then
+    pi_files=()
+    for tmp_image in "${tmp_images[@]}"; do
+      pi_files+=("@$tmp_image")
+    done
+    reply=$(cd "$W" && pi --session-dir "$S" -c -p "${pi_files[@]}" "$prompt" </dev/null 2>&1)
+    rm -f "${tmp_images[@]}"
+  else
+    reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
+  fi
   [[ -n "$reply" ]] || reply="(pi: réponse vide)"
   herald send --chat-id "$CHAT_ID" "$reply"
 done
