@@ -3,7 +3,8 @@
 #
 # Built on `herald recv --follow` and `herald send` (no socat/jq). pi's
 # conversation persists across messages via an isolated session dir; "/new"
-# resets the agent context only (the Telegram chat is untouched).
+# resets the agent context only (the Telegram chat is untouched), and "/reload"
+# reloads pi resources (extensions, skills, prompts, context files).
 #
 # Env:
 #   HERALD_SOCKET          socket path (default: /tmp/herald.sock)
@@ -195,6 +196,13 @@ $transcript"
   fi
 
   [[ -n "$prompt" || ${#tmp_images[@]} -gt 0 ]] || continue
+  if [[ "$prompt" == "/reload" ]]; then
+    rm -f "${tmp_images[@]}"
+    reply=$(cd "$W" && pi --session-dir "$S" -c -p "/reload" </dev/null 2>&1)
+    [[ -n "$reply" ]] || reply="♻️ Pi rechargé."
+    herald send --chat-id "$CHAT_ID" "$reply"
+    continue
+  fi
   if [[ "$prompt" == "/new" ]]; then
     rm -f "${tmp_images[@]}"
     reset_pi_session
