@@ -113,6 +113,55 @@ reset_pi_session() {
 
 echo "herald-pi-bridge: listening (sessions: $S)" >&2
 
+current_pi_pid=""
+
+pi_is_running() {
+  [[ -n "${current_pi_pid:-}" ]] && kill -0 "$current_pi_pid" 2>/dev/null
+}
+
+stop_current_pi() {
+  if pi_is_running; then
+    pkill -TERM -P "$current_pi_pid" 2>/dev/null || true
+    kill -TERM "$current_pi_pid" 2>/dev/null || true
+    sleep 0.2
+    pkill -KILL -P "$current_pi_pid" 2>/dev/null || true
+    kill -KILL "$current_pi_pid" 2>/dev/null || true
+    wait "$current_pi_pid" 2>/dev/null || true
+  fi
+  current_pi_pid=""
+}
+
+start_pi_reply() {
+  local chat_id="$1"
+  local prompt="$2"
+  shift 2
+  local tmp_images=("$@")
+
+  if pi_is_running; then
+    rm -f "${tmp_images[@]}"
+    herald send --chat-id "$chat_id" "⏳ Pi traite déjà un message. Envoie /new ou /reload pour l'interrompre."
+    return
+  fi
+
+  (
+    local reply
+    if [[ ${#tmp_images[@]} -gt 0 ]]; then
+      local pi_files=()
+      local tmp_image
+      for tmp_image in "${tmp_images[@]}"; do
+        pi_files+=("@$tmp_image")
+      done
+      reply=$(cd "$W" && pi --session-dir "$S" -c -p "${pi_files[@]}" "$prompt" </dev/null 2>&1)
+      rm -f "${tmp_images[@]}"
+    else
+      reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
+    fi
+    [[ -n "$reply" ]] || reply="(pi: réponse vide)"
+    herald send --chat-id "$chat_id" "$reply"
+  ) &
+  current_pi_pid=$!
+}
+
 herald recv --follow --json | while IFS= read -r raw; do
   [[ -n "$raw" ]] || continue
   eval "$(python3 - "$raw" <<'PY'
@@ -198,27 +247,19 @@ $transcript"
   [[ -n "$prompt" || ${#tmp_images[@]} -gt 0 ]] || continue
   if [[ "$prompt" == "/reload" ]]; then
     rm -f "${tmp_images[@]}"
-    reply=$(cd "$W" && pi --session-dir "$S" -c -p "/reload" </dev/null 2>&1)
-    [[ -n "$reply" ]] || reply="♻️ Pi rechargé."
-    herald send --chat-id "$CHAT_ID" "$reply"
+    stop_current_pi
+    herald send --chat-id "$CHAT_ID" "♻️ Pi bridge rechargé. Les prochains messages relanceront pi avec les ressources à jour."
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user restart herald-pi-bridge >/dev/null 2>&1 &
+    fi
     continue
   fi
   if [[ "$prompt" == "/new" ]]; then
     rm -f "${tmp_images[@]}"
+    stop_current_pi
     reset_pi_session
     herald send --chat-id "$CHAT_ID" "🔄 Nouvelle conversation pi (contexte agent reset)."
     continue
   fi
-  if [[ ${#tmp_images[@]} -gt 0 ]]; then
-    pi_files=()
-    for tmp_image in "${tmp_images[@]}"; do
-      pi_files+=("@$tmp_image")
-    done
-    reply=$(cd "$W" && pi --session-dir "$S" -c -p "${pi_files[@]}" "$prompt" </dev/null 2>&1)
-    rm -f "${tmp_images[@]}"
-  else
-    reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
-  fi
-  [[ -n "$reply" ]] || reply="(pi: réponse vide)"
-  herald send --chat-id "$CHAT_ID" "$reply"
+  start_pi_reply "$CHAT_ID" "$prompt" "${tmp_images[@]}"
 done
