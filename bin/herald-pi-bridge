@@ -111,56 +111,190 @@ reset_pi_session() {
   find "$S" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 }
 
-echo "herald-pi-bridge: listening (sessions: $S)" >&2
+QUEUE_DIR="${HERALD_PI_QUEUE_DIR:-/tmp/herald-pi-bridge.queue}"
+RUN_PID_FILE="${HERALD_PI_RUN_PID_FILE:-/tmp/herald-pi-bridge.pi.pid}"
+if [[ -z "$QUEUE_DIR" || "$QUEUE_DIR" == "/" ]]; then
+  echo "herald-pi-bridge: unsafe queue dir: $QUEUE_DIR" >&2
+  exit 1
+fi
+mkdir -p "$QUEUE_DIR"
+find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 \( -name 'task-*' -o -name '.task-*' -o -name generation \) -exec rm -rf {} + 2>/dev/null || true
+rm -f "$RUN_PID_FILE"
+printf '0\n' > "$QUEUE_DIR/generation"
 
-current_pi_pid=""
+current_generation() {
+  cat "$QUEUE_DIR/generation" 2>/dev/null || printf '0\n'
+}
+
+bump_generation() {
+  local generation
+  generation="$(( $(current_generation) + 1 ))"
+  printf '%s\n' "$generation" > "$QUEUE_DIR/generation"
+}
 
 pi_is_running() {
-  [[ -n "${current_pi_pid:-}" ]] && kill -0 "$current_pi_pid" 2>/dev/null
+  [[ -f "$RUN_PID_FILE" ]] && kill -0 "$(cat "$RUN_PID_FILE")" 2>/dev/null
 }
 
 stop_current_pi() {
-  if pi_is_running; then
-    pkill -TERM -P "$current_pi_pid" 2>/dev/null || true
-    kill -TERM "$current_pi_pid" 2>/dev/null || true
-    sleep 0.2
-    pkill -KILL -P "$current_pi_pid" 2>/dev/null || true
-    kill -KILL "$current_pi_pid" 2>/dev/null || true
-    wait "$current_pi_pid" 2>/dev/null || true
+  local pid
+  if ! pi_is_running; then
+    rm -f "$RUN_PID_FILE"
+    return
   fi
-  current_pi_pid=""
+  pid="$(cat "$RUN_PID_FILE")"
+  pkill -TERM -P "$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.2
+  pkill -KILL -P "$pid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$RUN_PID_FILE"
 }
 
-start_pi_reply() {
+clear_pending_tasks() {
+  find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'task-*' -exec rm -rf {} + 2>/dev/null || true
+}
+
+next_task_dir() {
+  find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'task-*' 2>/dev/null | sort | head -n 1
+}
+
+run_pi_task() {
+  local task_dir="$1"
+  local chat_id prompt task_generation out reply rc pi_pid
+  local tmp_images=()
+
+  if [[ ! -f "$task_dir/chat_id" || ! -f "$task_dir/prompt" || ! -f "$task_dir/generation" ]]; then
+    rm -rf "$task_dir"
+    return
+  fi
+
+  chat_id="$(cat "$task_dir/chat_id")"
+  prompt="$(cat "$task_dir/prompt")"
+  task_generation="$(cat "$task_dir/generation")"
+  if [[ -f "$task_dir/images" ]]; then
+    local image_path
+    while IFS= read -r image_path; do
+      [[ -n "$image_path" ]] || continue
+      tmp_images+=("$image_path")
+    done < "$task_dir/images"
+  fi
+  if [[ "$task_generation" != "$(current_generation)" ]]; then
+    rm -f "${tmp_images[@]}"
+    rm -rf "$task_dir"
+    return
+  fi
+
+  out="$(mktemp /tmp/herald-pi-output-XXXXXX.log)"
+
+  if [[ ${#tmp_images[@]} -gt 0 ]]; then
+    local pi_files=()
+    local tmp_image
+    for tmp_image in "${tmp_images[@]}"; do
+      pi_files+=("@$tmp_image")
+    done
+    (cd "$W" && printf '%s' "$prompt" | pi --session-dir "$S" -c -p "${pi_files[@]}" >"$out" 2>&1) &
+    pi_pid=$!
+  else
+    (cd "$W" && printf '%s' "$prompt" | pi --session-dir "$S" -c -p >"$out" 2>&1) &
+    pi_pid=$!
+  fi
+
+  printf '%s\n' "$pi_pid" > "$RUN_PID_FILE"
+  if [[ "$task_generation" != "$(current_generation)" ]]; then
+    pkill -TERM -P "$pi_pid" 2>/dev/null || true
+    kill -TERM "$pi_pid" 2>/dev/null || true
+    wait "$pi_pid" 2>/dev/null || true
+    rm -f "$RUN_PID_FILE" "${tmp_images[@]}" "$out"
+    rm -rf "$task_dir"
+    return
+  fi
+
+  wait "$pi_pid"
+  rc=$?
+  rm -f "$RUN_PID_FILE" "${tmp_images[@]}"
+
+  if [[ "$task_generation" == "$(current_generation)" ]]; then
+    reply="$(cat "$out")"
+    [[ -n "$reply" ]] || reply="(pi: réponse vide)"
+    if [[ $rc -ne 0 ]]; then
+      reply="⚠️ pi exited with code $rc
+
+$reply"
+    fi
+    herald send --chat-id "$chat_id" "$reply"
+  fi
+
+  rm -f "$out"
+  rm -rf "$task_dir"
+}
+
+enqueue_pi_reply() {
   local chat_id="$1"
   local prompt="$2"
   shift 2
   local tmp_images=("$@")
+  local task_dir task_tmp task_id was_busy tmp_image
 
-  if pi_is_running; then
-    rm -f "${tmp_images[@]}"
-    herald send --chat-id "$chat_id" "⏳ Pi traite déjà un message. Envoie /new ou /reload pour l'interrompre."
-    return
+  was_busy=0
+  if pi_is_running || [[ -n "$(next_task_dir)" ]]; then
+    was_busy=1
   fi
 
-  (
-    local reply
-    if [[ ${#tmp_images[@]} -gt 0 ]]; then
-      local pi_files=()
-      local tmp_image
-      for tmp_image in "${tmp_images[@]}"; do
-        pi_files+=("@$tmp_image")
-      done
-      reply=$(cd "$W" && pi --session-dir "$S" -c -p "${pi_files[@]}" "$prompt" </dev/null 2>&1)
-      rm -f "${tmp_images[@]}"
-    else
-      reply=$(cd "$W" && pi --session-dir "$S" -c -p "$prompt" </dev/null 2>&1)
-    fi
-    [[ -n "$reply" ]] || reply="(pi: réponse vide)"
-    herald send --chat-id "$chat_id" "$reply"
-  ) &
-  current_pi_pid=$!
+  task_id="$(date +%s%N)-$$-$RANDOM"
+  task_tmp="$QUEUE_DIR/.task-$task_id"
+  task_dir="$QUEUE_DIR/task-$task_id"
+  mkdir "$task_tmp"
+  printf '%s\n' "$chat_id" > "$task_tmp/chat_id"
+  printf '%s' "$prompt" > "$task_tmp/prompt"
+  printf '%s\n' "$(current_generation)" > "$task_tmp/generation"
+  : > "$task_tmp/images"
+  for tmp_image in "${tmp_images[@]}"; do
+    [[ -n "$tmp_image" ]] || continue
+    printf '%s\n' "$tmp_image" >> "$task_tmp/images"
+  done
+  mv "$task_tmp" "$task_dir"
+
+  if [[ $was_busy -eq 1 ]]; then
+    herald send --chat-id "$chat_id" "📥 Message ajouté à la file Pi."
+  fi
 }
+
+process_queue() {
+  local task_dir
+  while true; do
+    task_dir="$(next_task_dir)"
+    if [[ -z "$task_dir" ]]; then
+      sleep 0.2
+      continue
+    fi
+    run_pi_task "$task_dir"
+  done
+}
+
+process_queue &
+queue_worker_pid=$!
+
+cleanup_done=0
+cleanup() {
+  if [[ $cleanup_done -eq 1 ]]; then
+    return
+  fi
+  cleanup_done=1
+  if [[ -n "${queue_worker_pid:-}" ]]; then
+    kill "$queue_worker_pid" 2>/dev/null || true
+    wait "$queue_worker_pid" 2>/dev/null || true
+  fi
+  stop_current_pi
+}
+handle_shutdown() {
+  cleanup
+  exit 0
+}
+trap cleanup EXIT
+trap handle_shutdown INT TERM
+
+echo "herald-pi-bridge: listening (sessions: $S, queue: $QUEUE_DIR)" >&2
 
 herald recv --follow --json | while IFS= read -r raw; do
   [[ -n "$raw" ]] || continue
@@ -247,6 +381,8 @@ $transcript"
   [[ -n "$prompt" || ${#tmp_images[@]} -gt 0 ]] || continue
   if [[ "$prompt" == "/reload" ]]; then
     rm -f "${tmp_images[@]}"
+    bump_generation
+    clear_pending_tasks
     stop_current_pi
     herald send --chat-id "$CHAT_ID" "♻️ Pi bridge rechargé. Les prochains messages relanceront pi avec les ressources à jour."
     if command -v systemctl >/dev/null 2>&1; then
@@ -256,10 +392,12 @@ $transcript"
   fi
   if [[ "$prompt" == "/new" ]]; then
     rm -f "${tmp_images[@]}"
+    bump_generation
+    clear_pending_tasks
     stop_current_pi
     reset_pi_session
     herald send --chat-id "$CHAT_ID" "🔄 Nouvelle conversation pi (contexte agent reset)."
     continue
   fi
-  start_pi_reply "$CHAT_ID" "$prompt" "${tmp_images[@]}"
+  enqueue_pi_reply "$CHAT_ID" "$prompt" "${tmp_images[@]}"
 done

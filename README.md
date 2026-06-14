@@ -105,6 +105,8 @@ Bridge-only variables (`herald-pi-bridge`):
 | `HERALD_PI_SESSION_DIR` | `~/.herald/pi-sessions` | Isolated pi session storage (keeps `pi -c` scoped to the bridge) |
 | `HERALD_PI_WORKDIR` | `$HOME` | Working directory pi runs in |
 | `HERALD_PI_LOCK_FILE` | `/tmp/herald-pi-bridge.lock` | Process lock so only one responding pi bridge runs |
+| `HERALD_PI_QUEUE_DIR` | `/tmp/herald-pi-bridge.queue` | Pending-message queue for sequential pi runs |
+| `HERALD_PI_RUN_PID_FILE` | `/tmp/herald-pi-bridge.pi.pid` | PID file for the active pi process, used by `/new` and `/reload` |
 | `HERALD_WHISPER_ROOT` | `~/projects/oss/whisper.cpp` | whisper.cpp install root used for Telegram voice notes |
 | `HERALD_WHISPER_MODEL` | `$HERALD_WHISPER_ROOT/models/ggml-base.bin` | Whisper model path |
 | `HERALD_PI_VOICE_LANG` | `auto` | Whisper language override for voice note transcription |
@@ -178,7 +180,8 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
 - Telegram **photos/images** are downloaded and passed to `pi` as `@image`
   file arguments, with the caption used as the prompt when present. Telegram
   albums are buffered briefly, then sent to `pi` in one multi-image prompt.
-- pi runs **on demand** (one process per message); only herald runs continuously.
+- pi runs **on demand** (one process per message), with inbound messages queued
+  and processed sequentially; only herald runs continuously.
 
 ```bash
 herald serve &           # daemon must be running first
