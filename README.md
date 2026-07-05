@@ -102,12 +102,13 @@ Bridge-only variables (`herald-pi-bridge`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `HERALD_PI_SESSION_DIR` | `~/.herald/pi-sessions` | Isolated pi session storage (keeps `pi -c` scoped to the bridge) |
+| `HERALD_PI_SESSION_DIR` | `~/.herald/pi-sessions` | Isolated pi session storage for bridge conversations |
 | `HERALD_PI_WORKDIR` | `$HOME` | Working directory pi runs in |
 | `HERALD_PI_LOCK_FILE` | `/tmp/herald-pi-bridge.lock` | Process lock so only one responding pi bridge runs |
+| `HERALD_PI_ACTIVE_SESSION_FILE` | `$HERALD_PI_SESSION_DIR/.herald-active-session` | Active pi conversation id marker used by `/new` and `/continue` |
 | `HERALD_PI_QUEUE_DIR` | `/tmp/herald-pi-bridge.queue` | Pending-message queue for sequential pi runs |
 | `HERALD_PI_RUN_PID_FILE` | `/tmp/herald-pi-bridge.pi.pid` | PID file for the active pi process, used by `/new` and `/reload` |
-| `HERALD_WHISPER_ROOT` | `~/projects/oss/whisper.cpp` | whisper.cpp install root used for Telegram voice notes |
+| `HERALD_WHISPER_ROOT` | `~/Projects/oss/whisper.cpp` | whisper.cpp install root used for Telegram voice notes |
 | `HERALD_WHISPER_MODEL` | `$HERALD_WHISPER_ROOT/models/ggml-base.bin` | Whisper model path |
 | `HERALD_PI_VOICE_LANG` | `auto` | Whisper language override for voice note transcription |
 
@@ -171,10 +172,11 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
 ```
 
 - The pi conversation **persists across messages** (context carries over),
-  using an isolated session dir so `pi -c` only ever continues this bridge's
-  own conversation.
+  using an isolated session dir and an active-session marker scoped to this
+  bridge.
 - Sending **`/new`** from Telegram resets the agent context only — the Telegram
-  chat itself is untouched.
+  chat itself is untouched — and replies with the closed conversation ID.
+- Sending **`/continue <conversation-id>`** resumes a previous pi conversation.
 - Telegram **voice notes** are downloaded, transcribed with `whisper.cpp`, then
   appended to the prompt before `pi` runs.
 - Telegram **photos/images** are downloaded and passed to `pi` as `@image`

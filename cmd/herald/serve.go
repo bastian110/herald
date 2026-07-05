@@ -55,11 +55,11 @@ func run(ctx context.Context, cfg Config) error {
 	poller := telegram.NewPoller(client, cfg.PollTimeout)
 	r := router.New()
 
-	send := func(chatID int64, text string) error {
+	send := func(chatID int64, text string, parseMode string) error {
 		if chatID == 0 {
 			chatID = cfg.DefaultChatID
 		}
-		return client.SendMessage(chatID, text)
+		return client.SendMessage(chatID, text, parseMode)
 	}
 
 	srv := socket.New(cfg.SocketPath, r, send)

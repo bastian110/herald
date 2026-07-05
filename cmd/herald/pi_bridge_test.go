@@ -106,6 +106,176 @@ printf 'PI OK\n'
 	if !strings.Contains(sent, "PI OK") {
 		t.Fatalf("bridge did not send pi output; send log:\n%s", sent)
 	}
+	if !strings.Contains(sent, "--parse-mode HTML") {
+		t.Fatalf("bridge should send pi replies with HTML parse mode by default; send log:\n%s", sent)
+	}
+}
+
+func TestPiBridgeNewReturnsClosedConversationID(t *testing.T) {
+	tmp := t.TempDir()
+	bridgePath := copyPiBridge(t, tmp)
+	sessionsDir := filepath.Join(tmp, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldSessionID := "019f3165-0b84-7640-bc80-35ba1f31eeb7"
+	oldSession := filepath.Join(sessionsDir, "2026-07-05T08-28-53-509Z_"+oldSessionID+".jsonl")
+	if err := os.WriteFile(oldSession, []byte(`{"type":"session","version":3,"id":"`+oldSessionID+`","timestamp":"2026-07-05T08:28:53.509Z","cwd":"/tmp"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sendLog := filepath.Join(tmp, "send.log")
+	writeExecutable(t, filepath.Join(tmp, "herald"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "recv" ]]; then
+  printf '%s\n' '{"kind":"text","text":"/new","chat_id":123}'
+  for _ in $(seq 1 50); do
+    [[ -s "$HERALD_TEST_SEND_LOG" ]] && exit 0
+    sleep 0.1
+  done
+  exit 1
+fi
+if [[ "${1:-}" == "send" ]]; then
+  printf '%s\n' "$*" >> "$HERALD_TEST_SEND_LOG"
+  exit 0
+fi
+exit 2
+`)
+	writeExecutable(t, filepath.Join(tmp, "pi"), "#!/usr/bin/env bash\nexit 99\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bridgePath)
+	cmd.Dir = tmp
+	cmd.Env = bridgeTestEnv(tmp, sendLog, filepath.Join(tmp, "pi.log"), sessionsDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	output := &strings.Builder{}
+	cmd.Stdout = output
+	cmd.Stderr = output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer killProcessGroup(t, cmd.Process.Pid)
+	waitForFileContent(ctx, t, sendLog)
+	killProcessGroup(t, cmd.Process.Pid)
+	if err := cmd.Wait(); err != nil && ctx.Err() != nil {
+		t.Fatalf("bridge timed out: %v\n%s", err, output.String())
+	}
+
+	sent := readString(t, sendLog)
+	if !strings.Contains(sent, oldSessionID) || !strings.Contains(sent, "/continue "+oldSessionID) {
+		t.Fatalf("/new did not return resumable session id; send log:\n%s", sent)
+	}
+	if _, err := os.Stat(oldSession); err != nil {
+		t.Fatalf("/new should preserve the old session file: %v", err)
+	}
+	activeMarker := readString(t, filepath.Join(sessionsDir, ".herald-active-session"))
+	if strings.TrimSpace(activeMarker) != "__new__" {
+		t.Fatalf("/new should mark the next pi run as a fresh session, got %q", activeMarker)
+	}
+}
+
+func TestPiBridgeContinueResumesRequestedConversation(t *testing.T) {
+	tmp := t.TempDir()
+	bridgePath := copyPiBridge(t, tmp)
+	sessionsDir := filepath.Join(tmp, "sessions")
+	if err := os.MkdirAll(sessionsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "019f3165-0b84-7640-bc80-35ba1f31eeb7"
+	sessionPath := filepath.Join(sessionsDir, "2026-07-05T08-28-53-509Z_"+sessionID+".jsonl")
+	if err := os.WriteFile(sessionPath, []byte(`{"type":"session","version":3,"id":"`+sessionID+`","timestamp":"2026-07-05T08:28:53.509Z","cwd":"/tmp"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sendLog := filepath.Join(tmp, "send.log")
+	piLog := filepath.Join(tmp, "pi.log")
+	writeExecutable(t, filepath.Join(tmp, "herald"), `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "recv" ]]; then
+  printf '%s\n' '{"kind":"text","text":"/continue 019f3165-0b84-7640-bc80-35ba1f31eeb7","chat_id":123}'
+  printf '%s\n' '{"kind":"text","text":"hello after resume","chat_id":123}'
+  for _ in $(seq 1 50); do
+    [[ -s "$HERALD_TEST_PI_LOG" ]] && exit 0
+    sleep 0.1
+  done
+  exit 1
+fi
+if [[ "${1:-}" == "send" ]]; then
+  printf '%s\n' "$*" >> "$HERALD_TEST_SEND_LOG"
+  exit 0
+fi
+exit 2
+`)
+	writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env bash
+set -euo pipefail
+{
+  printf 'args:'
+  for arg in "$@"; do printf ' <%s>' "$arg"; done
+  printf '\nstdin:%s\n' "$(cat)"
+} >> "$HERALD_TEST_PI_LOG"
+printf 'PI OK\n'
+`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bridgePath)
+	cmd.Dir = tmp
+	cmd.Env = bridgeTestEnv(tmp, sendLog, piLog, sessionsDir)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	output := &strings.Builder{}
+	cmd.Stdout = output
+	cmd.Stderr = output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer killProcessGroup(t, cmd.Process.Pid)
+	waitForFileContains(ctx, t, piLog, "stdin:hello after resume")
+	killProcessGroup(t, cmd.Process.Pid)
+	if err := cmd.Wait(); err != nil && ctx.Err() != nil {
+		t.Fatalf("bridge timed out: %v\n%s", err, output.String())
+	}
+
+	piOutput := readString(t, piLog)
+	if !strings.Contains(piOutput, "<--session> <"+sessionID+">") {
+		t.Fatalf("pi did not resume requested session; pi log:\n%s", piOutput)
+	}
+	if !strings.Contains(piOutput, "stdin:hello after resume") {
+		t.Fatalf("pi did not receive post-resume prompt; pi log:\n%s", piOutput)
+	}
+}
+
+func copyPiBridge(t *testing.T, tmp string) string {
+	t.Helper()
+	repoRoot := filepath.Join("..", "..")
+	bridgeSource := filepath.Join(repoRoot, "bin", "herald-pi-bridge")
+	bridgeDir := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(bridgeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bridgePath := filepath.Join(bridgeDir, "herald-pi-bridge")
+	bridgeBytes, err := os.ReadFile(bridgeSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bridgePath, bridgeBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bridgePath
+}
+
+func bridgeTestEnv(tmp string, sendLog string, piLog string, sessionsDir string) []string {
+	return append(os.Environ(),
+		"PATH="+tmp+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"HOME="+filepath.Join(tmp, "home"),
+		"HERALD_TEST_SEND_LOG="+sendLog,
+		"HERALD_TEST_PI_LOG="+piLog,
+		"HERALD_PI_SESSION_DIR="+sessionsDir,
+		"HERALD_PI_WORKDIR="+tmp,
+		"HERALD_PI_LOCK_FILE="+filepath.Join(tmp, "bridge.lock"),
+		"HERALD_PI_QUEUE_DIR="+filepath.Join(tmp, "queue"),
+		"HERALD_PI_RUN_PID_FILE="+filepath.Join(tmp, "pi.pid"),
+	)
 }
 
 func writeExecutable(t *testing.T, path string, content string) {
@@ -126,6 +296,16 @@ func readString(t *testing.T, path string) string {
 
 func waitForFileContent(ctx context.Context, t *testing.T, path string) {
 	t.Helper()
+	waitForFile(ctx, t, path, func(content string) bool { return len(content) > 0 })
+}
+
+func waitForFileContains(ctx context.Context, t *testing.T, path string, needle string) {
+	t.Helper()
+	waitForFile(ctx, t, path, func(content string) bool { return strings.Contains(content, needle) })
+}
+
+func waitForFile(ctx context.Context, t *testing.T, path string, ready func(string) bool) {
+	t.Helper()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -134,7 +314,7 @@ func waitForFileContent(ctx context.Context, t *testing.T, path string) {
 			t.Fatalf("timed out waiting for %s", path)
 		case <-ticker.C:
 			content, err := os.ReadFile(path)
-			if err == nil && len(content) > 0 {
+			if err == nil && ready(string(content)) {
 				return
 			}
 		}

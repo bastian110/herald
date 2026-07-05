@@ -14,13 +14,13 @@ import (
 	"github.com/bastian110/herald/internal/socket"
 )
 
-func startServer(t *testing.T, path string, send func(int64, string) error) (*router.Router, context.CancelFunc) {
+func startServer(t *testing.T, path string, send func(int64, string, string) error) (*router.Router, context.CancelFunc) {
 	t.Helper()
 	os.Remove(path)
 	r := router.New()
 	srv := socket.New(path, r, send)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	go srv.Run(ctx) //nolint:errcheck
+	go srv.Run(ctx)                   //nolint:errcheck
 	time.Sleep(20 * time.Millisecond) // wait for socket to be ready
 	t.Cleanup(func() { cancel(); os.Remove(path) })
 	return r, cancel
@@ -39,9 +39,11 @@ func dialUnix(t *testing.T, path string) net.Conn {
 func TestSendOpForwardsToSendFn(t *testing.T) {
 	var gotChatID int64
 	var gotText string
-	send := func(chatID int64, text string) error {
+	var gotParseMode string
+	send := func(chatID int64, text string, parseMode string) error {
 		gotChatID = chatID
 		gotText = text
+		gotParseMode = parseMode
 		return nil
 	}
 
@@ -50,7 +52,7 @@ func TestSendOpForwardsToSendFn(t *testing.T) {
 
 	conn := dialUnix(t, "/tmp/herald-test-send.sock")
 
-	env := protocol.Envelope{Op: "send", Text: "hello", ChatID: 456}
+	env := protocol.Envelope{Op: "send", Text: "hello", ChatID: 456, ParseMode: "HTML"}
 	b, _ := json.Marshal(env)
 	conn.Write(append(b, '\n'))
 
@@ -70,10 +72,13 @@ func TestSendOpForwardsToSendFn(t *testing.T) {
 	if gotText != "hello" {
 		t.Errorf("text: want hello got %q", gotText)
 	}
+	if gotParseMode != "HTML" {
+		t.Errorf("parseMode: want HTML got %q", gotParseMode)
+	}
 }
 
 func TestInboundBroadcastReachesHarness(t *testing.T) {
-	r, cancel := startServer(t, "/tmp/herald-test-inbound.sock", func(int64, string) error { return nil })
+	r, cancel := startServer(t, "/tmp/herald-test-inbound.sock", func(int64, string, string) error { return nil })
 	defer cancel()
 
 	conn := dialUnix(t, "/tmp/herald-test-inbound.sock")

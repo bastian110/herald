@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 )
@@ -30,29 +31,54 @@ func NewClientWithBase(token, baseURL string) *Client {
 }
 
 type sendMessageReq struct {
-	ChatID int64  `json:"chat_id"`
-	Text   string `json:"text"`
+	ChatID    int64  `json:"chat_id"`
+	Text      string `json:"text"`
+	ParseMode string `json:"parse_mode,omitempty"`
+}
+
+type sendRichMessageReq struct {
+	ChatID      int64            `json:"chat_id"`
+	RichMessage inputRichMessage `json:"rich_message"`
+}
+
+type inputRichMessage struct {
+	HTML string `json:"html,omitempty"`
 }
 
 // maxMessageLen is the Telegram Bot API hard limit for sendMessage text.
 const maxMessageLen = 4096
 
 // SendMessage posts a text message to the given Telegram chat.
-// If text exceeds the Telegram 4096-character limit it is split into chunks
-// and sent as consecutive messages.
-func (c *Client) SendMessage(chatID int64, text string) error {
+// HTML messages are sent via sendRichMessage so Bot API rich HTML blocks like
+// tables render natively. If rich sending fails, it falls back to sendMessage
+// with sanitized HTML for older Bot API deployments or malformed rich input.
+// Non-HTML messages over Telegram's 4096-character sendMessage limit are split
+// into consecutive messages.
+func (c *Client) SendMessage(chatID int64, text string, parseMode string) error {
+	if parseMode == "HTML" {
+		if err := c.sendRichHTML(chatID, prepareTelegramRichHTML(text)); err == nil {
+			return nil
+		}
+		text = prepareTelegramText(text, parseMode)
+	} else {
+		text = prepareTelegramText(text, parseMode)
+	}
+
 	chunks := splitMessage(text, maxMessageLen)
 	for _, chunk := range chunks {
-		if err := c.sendChunk(chatID, chunk); err != nil {
+		if err := c.sendChunk(chatID, chunk, parseMode); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Client) sendChunk(chatID int64, text string) error {
-	url := fmt.Sprintf("%s/bot%s/sendMessage", c.baseURL, c.token)
-	body, err := json.Marshal(sendMessageReq{ChatID: chatID, Text: text})
+func (c *Client) sendRichHTML(chatID int64, htmlText string) error {
+	url := fmt.Sprintf("%s/bot%s/sendRichMessage", c.baseURL, c.token)
+	body, err := json.Marshal(sendRichMessageReq{
+		ChatID:      chatID,
+		RichMessage: inputRichMessage{HTML: htmlText},
+	})
 	if err != nil {
 		return err
 	}
@@ -62,9 +88,35 @@ func (c *Client) sendChunk(chatID int64, text string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram sendMessage: HTTP %d", resp.StatusCode)
+		return telegramHTTPError("sendRichMessage", resp)
 	}
 	return nil
+}
+
+func (c *Client) sendChunk(chatID int64, text string, parseMode string) error {
+	url := fmt.Sprintf("%s/bot%s/sendMessage", c.baseURL, c.token)
+	body, err := json.Marshal(sendMessageReq{ChatID: chatID, Text: text, ParseMode: parseMode})
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpCl.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return telegramHTTPError("sendMessage", resp)
+	}
+	return nil
+}
+
+func telegramHTTPError(method string, resp *http.Response) error {
+	responseBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	responseBody = bytes.TrimSpace(responseBody)
+	if len(responseBody) > 0 {
+		return fmt.Errorf("telegram %s: HTTP %d: %s", method, resp.StatusCode, responseBody)
+	}
+	return fmt.Errorf("telegram %s: HTTP %d", method, resp.StatusCode)
 }
 
 // splitMessage breaks s into chunks of at most max runes, splitting on

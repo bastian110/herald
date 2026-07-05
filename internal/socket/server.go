@@ -16,11 +16,11 @@ import (
 type Server struct {
 	path   string
 	router *router.Router
-	send   func(chatID int64, text string) error
+	send   func(chatID int64, text string, parseMode string) error
 }
 
 // New creates a Server. send is called when a harness writes a "send" op.
-func New(path string, r *router.Router, send func(int64, string) error) *Server {
+func New(path string, r *router.Router, send func(int64, string, string) error) *Server {
 	return &Server{path: path, router: r, send: send}
 }
 
@@ -81,7 +81,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		if env.Op != "send" {
 			continue
 		}
-		err := s.send(env.ChatID, env.Text)
+		err := s.send(env.ChatID, env.Text, env.ParseMode)
 		var ack protocol.Envelope
 		if err != nil {
 			ack = protocol.Envelope{Op: "error", Error: err.Error()}

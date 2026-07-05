@@ -23,14 +23,14 @@ func Dial(socketPath string) (net.Conn, error) {
 }
 
 // Send writes a single send op and returns the daemon's ack/error envelope.
-func Send(socketPath, text string, chatID int64) (protocol.Envelope, error) {
+func Send(socketPath, text string, chatID int64, parseMode string) (protocol.Envelope, error) {
 	conn, err := Dial(socketPath)
 	if err != nil {
 		return protocol.Envelope{}, err
 	}
 	defer conn.Close()
 
-	out, err := protocol.Encode(protocol.Envelope{Op: "send", Text: text, ChatID: chatID})
+	out, err := protocol.Encode(protocol.Envelope{Op: "send", Text: text, ChatID: chatID, ParseMode: parseMode})
 	if err != nil {
 		return protocol.Envelope{}, err
 	}

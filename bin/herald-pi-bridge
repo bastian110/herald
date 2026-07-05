@@ -3,17 +3,19 @@
 #
 # Built on `herald recv --follow` and `herald send` (no socat/jq). pi's
 # conversation persists across messages via an isolated session dir; "/new"
-# resets the agent context only (the Telegram chat is untouched), and "/reload"
-# reloads pi resources (extensions, skills, prompts, context files).
+# resets the agent context and returns the closed conversation id; "/continue ID"
+# resumes a previous conversation; "/reload" reloads pi resources.
 #
 # Env:
 #   HERALD_SOCKET          socket path (default: /tmp/herald.sock)
 #   HERALD_PI_SESSION_DIR  pi session storage (default: ~/.herald/pi-sessions)
 #   HERALD_PI_WORKDIR      working dir for pi (default: $HOME)
 #   HERALD_PI_LOCK_FILE    single-run lock path (default: /tmp/herald-pi-bridge.lock)
-#   HERALD_WHISPER_ROOT    whisper.cpp install root (default: ~/projects/oss/whisper.cpp)
+#   HERALD_PI_ACTIVE_SESSION_FILE active pi session id marker (default: $HERALD_PI_SESSION_DIR/.herald-active-session)
+#   HERALD_WHISPER_ROOT    whisper.cpp install root (default: ~/Projects/oss/whisper.cpp)
 #   HERALD_WHISPER_MODEL   whisper model path (default: $HERALD_WHISPER_ROOT/models/ggml-base.bin)
 #   HERALD_PI_VOICE_LANG   whisper language (default: auto)
+#   HERALD_PI_PARSE_MODE   Telegram format for pi replies (default: HTML uses rich messages; empty disables)
 #
 # Telegram photos are downloaded and passed to pi as @image file arguments.
 set -uo pipefail
@@ -27,10 +29,13 @@ export PATH="$SCRIPT_DIR/..:$HOME/.local/bin:$HOME/.local/go/bin:$HOME/go/bin:$P
 S="${HERALD_PI_SESSION_DIR:-$HOME/.herald/pi-sessions}"
 W="${HERALD_PI_WORKDIR:-$HOME}"
 L="${HERALD_PI_LOCK_FILE:-/tmp/herald-pi-bridge.lock}"
-WHISPER_ROOT="${HERALD_WHISPER_ROOT:-$HOME/projects/oss/whisper.cpp}"
+WHISPER_ROOT="${HERALD_WHISPER_ROOT:-$HOME/Projects/oss/whisper.cpp}"
 WHISPER_MODEL="${HERALD_WHISPER_MODEL:-$WHISPER_ROOT/models/ggml-base.bin}"
 WHISPER_CLI="$WHISPER_ROOT/build/bin/whisper-cli"
 VOICE_LANG="${HERALD_PI_VOICE_LANG:-auto}"
+PI_PARSE_MODE="${HERALD_PI_PARSE_MODE:-HTML}"
+ACTIVE_SESSION_FILE="${HERALD_PI_ACTIVE_SESSION_FILE:-$S/.herald-active-session}"
+NEW_SESSION_SENTINEL="__new__"
 mkdir -p "$S"
 
 if command -v flock >/dev/null 2>&1; then
@@ -107,8 +112,134 @@ transcribe_voice() {
   return $rc
 }
 
-reset_pi_session() {
-  find "$S" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+session_id_from_file() {
+  local session_file="$1"
+  python3 - "$session_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    with path.open(encoding="utf-8") as handle:
+        header = json.loads(handle.readline())
+except Exception:
+    print("")
+    raise SystemExit(0)
+print(header.get("id", ""))
+PY
+}
+
+latest_session_file() {
+  python3 - "$S" <<'PY'
+import sys
+from pathlib import Path
+
+session_dir = Path(sys.argv[1])
+files = [path for path in session_dir.glob("*.jsonl") if path.is_file()]
+if files:
+    print(max(files, key=lambda path: path.stat().st_mtime))
+PY
+}
+
+latest_session_id() {
+  local session_file
+  session_file="$(latest_session_file)"
+  [[ -n "$session_file" ]] || return 0
+  session_id_from_file "$session_file"
+}
+
+resolve_session_id() {
+  local query="$1"
+  python3 - "$S" "$query" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+session_dir = Path(sys.argv[1])
+query = sys.argv[2].strip()
+if not query:
+    raise SystemExit(1)
+
+matches: list[str] = []
+for path in session_dir.glob("*.jsonl"):
+    try:
+        with path.open(encoding="utf-8") as handle:
+            header = json.loads(handle.readline())
+    except Exception:
+        continue
+    session_id = str(header.get("id", ""))
+    if session_id == query or session_id.startswith(query):
+        matches.append(session_id)
+
+matches = sorted(set(matches))
+if len(matches) == 1:
+    print(matches[0])
+    raise SystemExit(0)
+if len(matches) > 1:
+    print("\n".join(matches[:5]))
+    raise SystemExit(2)
+raise SystemExit(1)
+PY
+}
+
+active_session_id() {
+  local session_id
+  if [[ -f "$ACTIVE_SESSION_FILE" ]]; then
+    session_id="$(head -n 1 "$ACTIVE_SESSION_FILE" 2>/dev/null || true)"
+    if [[ "$session_id" == "$NEW_SESSION_SENTINEL" ]]; then
+      return 0
+    fi
+    if [[ -n "$session_id" ]] && resolve_session_id "$session_id" >/dev/null 2>&1; then
+      printf '%s\n' "$session_id"
+      return 0
+    fi
+  fi
+  session_id="$(latest_session_id)"
+  if [[ -n "$session_id" ]]; then
+    printf '%s\n' "$session_id" > "$ACTIVE_SESSION_FILE"
+    printf '%s\n' "$session_id"
+  fi
+}
+
+mark_new_session() {
+  printf '%s\n' "$NEW_SESSION_SENTINEL" > "$ACTIVE_SESSION_FILE"
+}
+
+set_active_session_id() {
+  local session_id="$1"
+  printf '%s\n' "$session_id" > "$ACTIVE_SESSION_FILE"
+}
+
+refresh_active_session_id_after_run() {
+  local previous_session_id="$1"
+  local previous_session_file="$2"
+  local session_file session_id
+
+  session_file="$(latest_session_file)"
+  [[ -n "$session_file" ]] || return 0
+  if [[ -z "$previous_session_id" && "$session_file" == "$previous_session_file" ]]; then
+    return 0
+  fi
+
+  session_id="$(session_id_from_file "$session_file")"
+  [[ -n "$session_id" ]] || return 0
+  set_active_session_id "$session_id"
+}
+
+html_escape() {
+  python3 -c 'import html, sys; print(html.escape(sys.stdin.read(), quote=False), end="")'
+}
+
+send_pi_reply() {
+  local chat_id="$1"
+  local reply="$2"
+  if [[ -n "$PI_PARSE_MODE" ]]; then
+    herald send --chat-id "$chat_id" --parse-mode "$PI_PARSE_MODE" "$reply" \
+      || herald send --chat-id "$chat_id" "$reply"
+    return
+  fi
+  herald send --chat-id "$chat_id" "$reply"
 }
 
 QUEUE_DIR="${HERALD_PI_QUEUE_DIR:-/tmp/herald-pi-bridge.queue}"
@@ -161,8 +292,9 @@ next_task_dir() {
 
 run_pi_task() {
   local task_dir="$1"
-  local chat_id prompt task_generation out reply rc pi_pid
+  local chat_id prompt task_generation out reply rc pi_pid session_id session_file_before
   local tmp_images=()
+  local pi_args=(--session-dir "$S")
 
   if [[ ! -f "$task_dir/chat_id" || ! -f "$task_dir/prompt" || ! -f "$task_dir/generation" ]]; then
     rm -rf "$task_dir"
@@ -186,6 +318,11 @@ run_pi_task() {
   fi
 
   out="$(mktemp /tmp/herald-pi-output-XXXXXX.log)"
+  session_file_before="$(latest_session_file)"
+  session_id="$(active_session_id)"
+  if [[ -n "$session_id" ]]; then
+    pi_args+=(--session "$session_id")
+  fi
 
   if [[ ${#tmp_images[@]} -gt 0 ]]; then
     local pi_files=()
@@ -193,10 +330,10 @@ run_pi_task() {
     for tmp_image in "${tmp_images[@]}"; do
       pi_files+=("@$tmp_image")
     done
-    (cd "$W" && printf '%s' "$prompt" | pi --session-dir "$S" -c -p "${pi_files[@]}" >"$out" 2>&1) &
+    (cd "$W" && printf '%s' "$prompt" | pi "${pi_args[@]}" -p "${pi_files[@]}" >"$out" 2>&1) &
     pi_pid=$!
   else
-    (cd "$W" && printf '%s' "$prompt" | pi --session-dir "$S" -c -p >"$out" 2>&1) &
+    (cd "$W" && printf '%s' "$prompt" | pi "${pi_args[@]}" -p >"$out" 2>&1) &
     pi_pid=$!
   fi
 
@@ -215,6 +352,7 @@ run_pi_task() {
   rm -f "$RUN_PID_FILE" "${tmp_images[@]}"
 
   if [[ "$task_generation" == "$(current_generation)" ]]; then
+    refresh_active_session_id_after_run "$session_id" "$session_file_before"
     reply="$(cat "$out")"
     [[ -n "$reply" ]] || reply="(pi: réponse vide)"
     if [[ $rc -ne 0 ]]; then
@@ -222,7 +360,7 @@ run_pi_task() {
 
 $reply"
     fi
-    herald send --chat-id "$chat_id" "$reply"
+    send_pi_reply "$chat_id" "$reply"
   fi
 
   rm -f "$out"
@@ -395,8 +533,42 @@ $transcript"
     bump_generation
     clear_pending_tasks
     stop_current_pi
-    reset_pi_session
-    herald send --chat-id "$CHAT_ID" "🔄 Nouvelle conversation pi (contexte agent reset)."
+    closed_session_id="$(active_session_id)"
+    mark_new_session
+    if [[ -n "$closed_session_id" ]]; then
+      send_pi_reply "$CHAT_ID" "🔄 Nouvelle conversation pi.
+Conversation fermée : <code>$closed_session_id</code>
+Reprendre : <code>/continue $closed_session_id</code>"
+    else
+      send_pi_reply "$CHAT_ID" "🔄 Nouvelle conversation pi. Aucune conversation précédente trouvée."
+    fi
+    continue
+  fi
+  if [[ "$prompt" == "/continue" || "$prompt" == /continue\ * ]]; then
+    rm -f "${tmp_images[@]}"
+    continue_arg="${prompt#/continue}"
+    continue_arg="${continue_arg# }"
+    if [[ -z "$continue_arg" || "$continue_arg" == "$prompt" ]]; then
+      send_pi_reply "$CHAT_ID" "Usage : <code>/continue ID_CONVERSATION</code>"
+      continue
+    fi
+    resolved_session_id="$(resolve_session_id "$continue_arg")"
+    resolve_rc=$?
+    if [[ $resolve_rc -ne 0 ]]; then
+      case $resolve_rc in
+        2) send_pi_reply "$CHAT_ID" "⚠️ ID ambigu. Utilise un ID plus long." ;;
+        *)
+          escaped_continue_arg="$(printf '%s' "$continue_arg" | html_escape)"
+          send_pi_reply "$CHAT_ID" "⚠️ Conversation introuvable : <code>$escaped_continue_arg</code>"
+          ;;
+      esac
+      continue
+    fi
+    bump_generation
+    clear_pending_tasks
+    stop_current_pi
+    set_active_session_id "$resolved_session_id"
+    send_pi_reply "$CHAT_ID" "↩️ Conversation reprise : <code>$resolved_session_id</code>"
     continue
   fi
   enqueue_pi_reply "$CHAT_ID" "$prompt" "${tmp_images[@]}"

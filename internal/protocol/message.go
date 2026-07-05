@@ -7,16 +7,17 @@ import "encoding/json"
 //
 //	"ack" (herald→harness after send), "error" (herald→harness on failure).
 type Envelope struct {
-	Op       string   `json:"op"`
-	Kind     string   `json:"kind,omitempty"`
-	Text     string   `json:"text,omitempty"`
-	From     string   `json:"from,omitempty"`
-	ChatID   int64    `json:"chat_id,omitempty"`
-	FileID   string   `json:"file_id,omitempty"`
-	FileIDs  []string `json:"file_ids,omitempty"`
-	MimeType string   `json:"mime_type,omitempty"`
-	OK       bool     `json:"ok,omitempty"`
-	Error    string   `json:"message,omitempty"`
+	Op        string   `json:"op"`
+	Kind      string   `json:"kind,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	From      string   `json:"from,omitempty"`
+	ChatID    int64    `json:"chat_id,omitempty"`
+	FileID    string   `json:"file_id,omitempty"`
+	FileIDs   []string `json:"file_ids,omitempty"`
+	MimeType  string   `json:"mime_type,omitempty"`
+	ParseMode string   `json:"parse_mode,omitempty"`
+	OK        bool     `json:"ok,omitempty"`
+	Error     string   `json:"message,omitempty"`
 }
 
 // Encode serialises e to JSON and appends a newline delimiter.

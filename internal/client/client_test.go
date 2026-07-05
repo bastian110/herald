@@ -18,9 +18,9 @@ func startDaemon(t *testing.T, sent *[]protocol.Envelope, mu *sync.Mutex) (strin
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "c.sock")
 	r := router.New()
-	send := func(chatID int64, text string) error {
+	send := func(chatID int64, text string, parseMode string) error {
 		mu.Lock()
-		*sent = append(*sent, protocol.Envelope{Op: "send", Text: text, ChatID: chatID})
+		*sent = append(*sent, protocol.Envelope{Op: "send", Text: text, ChatID: chatID, ParseMode: parseMode})
 		mu.Unlock()
 		return nil
 	}
@@ -42,7 +42,7 @@ func TestSendReturnsAck(t *testing.T) {
 	var mu sync.Mutex
 	path, _ := startDaemon(t, &sent, &mu)
 
-	ack, err := client.Send(path, "hello", 42)
+	ack, err := client.Send(path, "hello", 42, "HTML")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,13 +51,13 @@ func TestSendReturnsAck(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(sent) != 1 || sent[0].Text != "hello" || sent[0].ChatID != 42 {
+	if len(sent) != 1 || sent[0].Text != "hello" || sent[0].ChatID != 42 || sent[0].ParseMode != "HTML" {
 		t.Errorf("daemon did not receive correct send: %+v", sent)
 	}
 }
 
 func TestSendErrorWhenDaemonDown(t *testing.T) {
-	_, err := client.Send(filepath.Join(t.TempDir(), "nope.sock"), "x", 0)
+	_, err := client.Send(filepath.Join(t.TempDir(), "nope.sock"), "x", 0, "")
 	if err == nil {
 		t.Fatal("expected error when daemon not running")
 	}
