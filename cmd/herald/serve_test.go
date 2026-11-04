@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -9,6 +11,72 @@ import (
 	"github.com/bastian110/herald/internal/router"
 	"github.com/bastian110/herald/internal/telegram"
 )
+
+func TestLocationEnvelope(t *testing.T) {
+	for _, tc := range []struct {
+		name, location, want string
+	}{
+		{"Paris", `{"latitude":48.8566,"longitude":2.3522}`, "latitude 48.8566, longitude 2.3522"},
+		{"zero", `{"latitude":0,"longitude":0}`, "latitude 0, longitude 0"},
+		{"negative", `{"latitude":-33.8688,"longitude":-151.2093}`, "latitude -33.8688, longitude -151.2093"},
+		{"invalid latitude", `{"latitude":91,"longitude":0}`, ""},
+		{"invalid longitude", `{"latitude":0,"longitude":-181}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var message telegram.Message
+			if err := json.Unmarshal([]byte(`{"chat":{"id":42},"location":`+tc.location+`}`), &message); err != nil {
+				t.Fatal(err)
+			}
+			env, ok := envelopeFromMessage(&message)
+			if tc.want == "" {
+				if ok {
+					t.Fatal("invalid coordinates accepted")
+				}
+				return
+			}
+			if !ok || env.Kind != "location" || env.ChatID != 42 || !strings.Contains(env.Text, tc.want) {
+				t.Fatalf("position missing or incorrect: %+v (ok=%v)", env, ok)
+			}
+			if !strings.Contains(env.Text, "https://www.openstreetmap.org/?mlat=") {
+				t.Fatalf("map link missing: %s", env.Text)
+			}
+		})
+	}
+}
+
+func TestBroadcastUpdatesDocument(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := router.New()
+	ch := r.Subscribe()
+	defer r.Unsubscribe(ch)
+	updates := make(chan telegram.Update, 1)
+	go broadcastUpdates(ctx, updates, r)
+
+	var update telegram.Update
+	if err := json.Unmarshal([]byte(`{"message":{"chat":{"id":42},"caption":"justificatif sport","document":{"file_id":"pdf-id","file_name":"Claire Levant.pdf","mime_type":"application/pdf","file_size":12345}}}`), &update); err != nil {
+		t.Fatal(err)
+	}
+	updates <- update
+	select {
+	case raw := <-ch:
+		var env map[string]any
+		if err := json.Unmarshal(raw, &env); err != nil {
+			t.Fatal(err)
+		}
+		for key, want := range map[string]any{
+			"kind": "document", "text": "justificatif sport", "chat_id": float64(42),
+			"file_id": "pdf-id", "file_name": "Claire Levant.pdf",
+			"mime_type": "application/pdf", "file_size": float64(12345),
+		} {
+			if env[key] != want {
+				t.Errorf("%s: want %v got %v", key, want, env[key])
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PDF silently dropped instead of broadcast to bridge")
+	}
+}
 
 func TestBroadcastUpdatesImage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

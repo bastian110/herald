@@ -180,6 +180,25 @@ func envelopeFromMessage(message *telegram.Message) (protocol.Envelope, bool) {
 		env.MimeType = "image/jpeg"
 		return env, true
 	}
+	if doc := message.Document; doc != nil && doc.FileID != "" {
+		env.Kind = "document"
+		env.Text = message.Caption
+		env.FileID = doc.FileID
+		env.MimeType = doc.MimeType
+		env.FileName = doc.FileName
+		env.FileSize = doc.FileSize
+		return env, true
+	}
+	if loc := message.Location; loc != nil {
+		if loc.Latitude < -90 || loc.Latitude > 90 || loc.Longitude < -180 || loc.Longitude > 180 {
+			return protocol.Envelope{}, false
+		}
+		lat := strconv.FormatFloat(loc.Latitude, 'f', -1, 64)
+		lon := strconv.FormatFloat(loc.Longitude, 'f', -1, 64)
+		env.Kind = "location"
+		env.Text = "Position Telegram reçue : latitude " + lat + ", longitude " + lon + ".\nCarte : https://www.openstreetmap.org/?mlat=" + lat + "&mlon=" + lon
+		return env, true
+	}
 	return protocol.Envelope{}, false
 }
 

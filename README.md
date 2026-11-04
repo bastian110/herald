@@ -126,6 +126,11 @@ Newline-delimited JSON over the Unix socket.
 {"op":"message","text":"reply","from":"bastian","chat_id":123456}
 ```
 
+Document messages retain their caption and original file metadata:
+```json
+{"op":"message","kind":"document","text":"justificatif sport","chat_id":123456,"file_id":"telegram-file-id","file_name":"justificatif.pdf","mime_type":"application/pdf","file_size":12345}
+```
+
 **Ack / error (herald → harness):**
 ```json
 {"op":"ack","ok":true}
@@ -182,6 +187,17 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
 - Telegram **photos/images** are downloaded and passed to `pi` as `@image`
   file arguments, with the caption used as the prompt when present. Telegram
   albums are buffered briefly, then sent to `pi` in one multi-image prompt.
+- Telegram **positions** are passed to pi as text with latitude, longitude and
+  an OpenStreetMap link. This also handles zero/negative coordinates. Only the
+  initial position is forwarded: live-location edits are not tracked.
+- Telegram **documents/PDFs** are downloaded via [`getFile`](https://core.telegram.org/bots/api#getfile)
+  (20 MB maximum) and saved privately under `$HERALD_PI_SESSION_DIR/attachments/`.
+  The caption and a safe local file path reach pi, not a binary `@file` argument.
+  For PDFs, pi is instructed to use `pdftotext` (from Poppler); scanned PDFs may
+  require rendering/OCR. Original files remain available for uploads and later
+  messages, including after `/new` or a restart. There is no automatic deletion:
+  remove unneeded attachments manually to reclaim disk space and personal data.
+  Failed or oversized downloads return an explicit error instead of being ignored.
 - pi runs **on demand** (one process per message), with inbound messages queued
   and processed sequentially; only herald runs continuously.
 

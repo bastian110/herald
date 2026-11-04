@@ -15,6 +15,8 @@ type Envelope struct {
 	FileID    string   `json:"file_id,omitempty"`
 	FileIDs   []string `json:"file_ids,omitempty"`
 	MimeType  string   `json:"mime_type,omitempty"`
+	FileName  string   `json:"file_name,omitempty"`
+	FileSize  int64    `json:"file_size,omitempty"`
 	ParseMode string   `json:"parse_mode,omitempty"`
 	OK        bool     `json:"ok,omitempty"`
 	Error     string   `json:"message,omitempty"`

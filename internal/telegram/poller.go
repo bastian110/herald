@@ -23,7 +23,23 @@ type Message struct {
 	From         *User       `json:"from,omitempty"`
 	Voice        *Voice      `json:"voice,omitempty"`
 	Photo        []PhotoSize `json:"photo,omitempty"`
+	Document     *Document   `json:"document,omitempty"`
+	Location     *Location   `json:"location,omitempty"`
 	MediaGroupID string      `json:"media_group_id,omitempty"`
+}
+
+// Location holds a Telegram position in degrees.
+type Location struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
+// Document holds Telegram file metadata, including PDFs.
+type Document struct {
+	FileID   string `json:"file_id"`
+	FileName string `json:"file_name,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
+	FileSize int64  `json:"file_size,omitempty"`
 }
 
 // Voice holds Telegram voice-note metadata.
