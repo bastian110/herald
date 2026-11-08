@@ -156,7 +156,8 @@ class Worker:
         self.busy_file.write_text(task["chat"])
         self.request_id = str(uuid.uuid4())
         self.command({"type": "prompt", "id": self.request_id,
-                      "message": task["prompt"], "images": images})
+                      "message": task["prompt"], "images": images,
+                      "streamingBehavior": "steer"})
 
     def handle(self, record):
         kind = record.get("type")

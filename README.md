@@ -197,6 +197,9 @@ User TG → herald → bridge queue → persistent Pi RPC → herald → User TG
 - Pi stays **alive but idle between messages**, without model calls while waiting.
   The same runtime retains extension state, such as a browser awaiting human 2FA.
   Inbound prompts remain sequential; an idle runtime is not reported as busy.
+  Each RPC prompt specifies `streamingBehavior: "steer"`, so if Pi is already
+  processing background work it accepts the message as steering instead of
+  rejecting it. Steering enters after the current turn's tool calls.
 - Extension input/confirmation/selection dialogs are forwarded immediately to
   Telegram with a unique `/answer <token> <response>` command. Only a matching,
   same-chat reply can answer a live dialog (`/answer <token> /cancel` cancels it).

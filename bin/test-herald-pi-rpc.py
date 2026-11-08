@@ -61,6 +61,21 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(self.worker.busy_file.exists())
         self.assertIsNotNone(self.worker.process)
 
+    def test_prompt_steers_an_already_processing_agent(self):
+        self.worker.submit(self.task())
+        command = self.commands()[0]
+        # Reproduce Pi RPC's preflight rejection when a background run is active.
+        steering = command.get("streamingBehavior") == "steer"
+        self.worker.handle({"type": "response", "id": command["id"],
+                            "success": steering,
+                            "error": "Agent is already processing. Specify streamingBehavior ('steer')",
+                            "data": {"disposition": "queued"}})
+        self.assertEqual(self.sent, [])
+        self.assertIsNotNone(self.worker.active)
+        self.message("steered answer")
+        self.worker.handle({"type": "agent_settled"})
+        self.assertEqual(self.sent, [("123", "steered answer")])
+
     def test_images_use_rpc_blocks_and_are_removed_after_response(self):
         image = self.root / "image.png"
         image.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
