@@ -55,14 +55,7 @@ else
  [[ "$TEST_FAILURE" != download ]]
 fi
 `)
-			writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env bash
-set -euo pipefail
-for arg in "$@"; do
- [[ "$arg" != @* ]] || { echo 'PDF must not be passed as a text/image @file'; exit 88; }
-done
-cat > "$HERALD_TEST_PI_LOG"
-printf 'PI OK\n'
-`)
+			writePiRPC(t, tmp)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, bridge)

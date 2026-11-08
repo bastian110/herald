@@ -39,11 +39,7 @@ elif [[ "$1" == send ]]; then
  printf '%s\n' "$*" >> "$HERALD_TEST_SEND_LOG"
 fi
 `)
-	writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env bash
-set -euo pipefail
-cat > "$HERALD_TEST_PI_LOG"
-printf 'PI OK\n'
-`)
+	writePiRPC(t, tmp)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bridge)
@@ -57,7 +53,7 @@ printf 'PI OK\n'
 	waitForFileContains(ctx, t, sendLog, "PI OK")
 	killProcessGroup(t, cmd.Process.Pid)
 	_ = cmd.Wait()
-	if prompt := readString(t, piLog); prompt != env.Text {
+	if prompt := readString(t, piLog); !strings.Contains(prompt, "stdin:"+env.Text+"\n") {
 		t.Fatalf("position not passed to pi: %q", prompt)
 	}
 }

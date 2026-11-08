@@ -21,6 +21,9 @@ EnvironmentFile=%h/Projects/herald/.env
 ExecStart=%h/Projects/herald/bin/herald-pi-bridge
 Restart=on-failure
 RestartSec=3
+# Signal only the bridge first; its worker owns Pi's graceful EOF shutdown.
+KillMode=mixed
+TimeoutStopSec=45
 
 [Install]
 WantedBy=default.target

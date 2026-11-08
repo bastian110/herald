@@ -13,20 +13,7 @@ import (
 
 func TestPiBridgeTextOnlyTaskDoesNotPassEmptyImageArgument(t *testing.T) {
 	tmp := t.TempDir()
-	repoRoot := filepath.Join("..", "..")
-	bridgeSource := filepath.Join(repoRoot, "bin", "herald-pi-bridge")
-	bridgeDir := filepath.Join(tmp, "bin")
-	if err := os.MkdirAll(bridgeDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	bridgePath := filepath.Join(bridgeDir, "herald-pi-bridge")
-	bridgeBytes, err := os.ReadFile(bridgeSource)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(bridgePath, bridgeBytes, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bridgePath := copyPiBridge(t, tmp)
 
 	sendLog := filepath.Join(tmp, "send.log")
 	piLog := filepath.Join(tmp, "pi.log")
@@ -46,21 +33,7 @@ if [[ "${1:-}" == "send" ]]; then
 fi
 exit 2
 `)
-	writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env bash
-set -euo pipefail
-{
-  printf 'args:'
-  for arg in "$@"; do printf ' <%s>' "$arg"; done
-  printf '\nstdin:%s\n' "$(cat)"
-} >> "$HERALD_TEST_PI_LOG"
-for arg in "$@"; do
-  if [[ "$arg" == "@" ]]; then
-    echo 'unexpected empty @file argument' >&2
-    exit 88
-  fi
-done
-printf 'PI OK\n'
-`)
+	writePiRPC(t, tmp)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -97,6 +70,9 @@ printf 'PI OK\n'
 	}
 	if !strings.Contains(piOutput, "stdin:hello from telegram") {
 		t.Fatalf("pi did not receive prompt on stdin; pi log:\n%s", piOutput)
+	}
+	if !strings.Contains(piOutput, "<--append-system-prompt> <Tu communiques via un bot Telegram. Utilise le HTML simplifié compatible avec Telegram") {
+		t.Fatalf("pi did not receive Telegram-only system instructions; pi log:\n%s", piOutput)
 	}
 
 	sent := readString(t, sendLog)
@@ -207,15 +183,7 @@ if [[ "${1:-}" == "send" ]]; then
 fi
 exit 2
 `)
-	writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env bash
-set -euo pipefail
-{
-  printf 'args:'
-  for arg in "$@"; do printf ' <%s>' "$arg"; done
-  printf '\nstdin:%s\n' "$(cat)"
-} >> "$HERALD_TEST_PI_LOG"
-printf 'PI OK\n'
-`)
+	writePiRPC(t, tmp)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -261,7 +229,43 @@ func copyPiBridge(t *testing.T, tmp string) string {
 	if err := os.WriteFile(bridgePath, bridgeBytes, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	helper, err := os.ReadFile(filepath.Join(repoRoot, "bin", "herald-pi-rpc.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bridgeDir, "herald-pi-rpc.py"), helper, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	return bridgePath
+}
+
+func writePiRPC(t *testing.T, tmp string) {
+	t.Helper()
+	writeExecutable(t, filepath.Join(tmp, "pi"), `#!/usr/bin/env python3
+import json, os, sys, time
+assert '--mode' in sys.argv and sys.argv[sys.argv.index('--mode') + 1] == 'rpc'
+assert '-p' not in sys.argv and not any(arg.startswith('@') for arg in sys.argv[1:])
+def emit(record):
+ print(json.dumps(record), flush=True)
+for line in sys.stdin:
+ record = json.loads(line)
+ if record['type'] == 'get_state':
+  emit({'type':'response', 'id':record['id'], 'success':True, 'data':{'sessionId':'test-session'}})
+ elif record['type'] == 'prompt':
+  with open(os.environ['HERALD_TEST_PI_LOG'], 'a') as log:
+   log.write('args:' + ''.join(' <'+arg+'>' for arg in sys.argv[1:]) + '\n')
+   log.write('pid:' + str(os.getpid()) + '\nstdin:' + record['message'] + '\n')
+  emit({'type':'response', 'id':record['id'], 'success':True, 'data':{'disposition':'started'}})
+  emit({'type':'message_end', 'message':{'role':'assistant','content':[{'type':'text','text':'PI OK'}]}})
+  emit({'type':'agent_end', 'willRetry':False})
+  emit({'type':'agent_settled','aborted':False})
+if os.environ.get('HERALD_TEST_CLEANUP'):
+ sys.stdout.write('x' * 200000)
+ sys.stdout.flush()
+ time.sleep(0.2)
+ with open(os.environ['HERALD_TEST_PI_LOG']+'.cleanup','a') as log:
+  log.write('pid:'+str(os.getpid())+'\n')
+`)
 }
 
 func bridgeTestEnv(tmp string, sendLog string, piLog string, sessionsDir string) []string {

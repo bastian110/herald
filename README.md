@@ -22,7 +22,7 @@ Harnesses connect to a Unix socket and exchange newline-delimited JSON. Herald l
                  herald send                herald recv              herald-pi-bridge
                  (notify, 1-shot)           (read; --follow streams) (persistent: recv→pi→send)
                                                                             │
-                                                                       pi -p "…"
+                                                                   pi --mode rpc
 ```
 
 **Three layers, each with one job:**
@@ -31,7 +31,7 @@ Harnesses connect to a Unix socket and exchange newline-delimited JSON. Herald l
 |-------|-----------|----------------|
 | Daemon | `herald serve` | Long-poll Telegram, broadcast inbound to all listeners, forward outbound. Pure transport — knows nothing about agents. |
 | Primitives | `herald send` / `herald recv` | Binary subcommands hiding the raw socket + JSON. For notifications and as building blocks for bridges. No `socat`/`jq` needed. |
-| Bridge | `herald-pi-bridge` | Harness-specific listener that drives an agent (`pi`): `recv → pi → send`, with session persistence and `/new` reset. |
+| Bridge | `herald-pi-bridge` + `herald-pi-rpc.py` | Harness-specific listener and persistent Pi RPC worker, with sequential prompts, session persistence and `/new` reset. |
 
 One Go binary carries everything generic (`serve`/`send`/`recv`); each **bridge stays specific to its harness** but is a trivial script over `herald recv --follow` + `herald send`.
 
@@ -161,19 +161,15 @@ between calls are not buffered. A durable listener holds **one** connection with
 
 ### Bridge (drive an agent from Telegram)
 
-`bin/herald-pi-bridge` follows the stream and, for each inbound message, runs the
-[`pi`](https://pi.dev) agent and sends the reply back — the whole bridge is three
-lines over the primitives:
-
-```bash
-herald recv --follow | while IFS= read -r text; do
-  reply=$(pi --session-dir "$S" -c -p "$text" </dev/null 2>&1)
-  herald send "$reply"
-done
-```
+`bin/herald-pi-bridge` receives messages and prepares attachments. Its Python
+standard-library worker, `bin/herald-pi-rpc.py`, starts
+[`pi --mode rpc`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+on the first prompt and keeps stdin open between messages. It consumes stdout
+continuously and sends the final assistant text when `agent_settled` arrives,
+not when Pi exits. Stderr remains in the service logs.
 
 ```
-User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
+User TG → herald → bridge queue → persistent Pi RPC → herald → User TG
 ```
 
 - The pi conversation **persists across messages** (context carries over),
@@ -184,8 +180,8 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
 - Sending **`/continue <conversation-id>`** resumes a previous pi conversation.
 - Telegram **voice notes** are downloaded, transcribed with `whisper.cpp`, then
   appended to the prompt before `pi` runs.
-- Telegram **photos/images** are downloaded and passed to `pi` as `@image`
-  file arguments, with the caption used as the prompt when present. Telegram
+- Telegram **photos/images** are downloaded and passed to `pi` as base64 RPC
+  image blocks, with the caption used as the prompt when present. Telegram
   albums are buffered briefly, then sent to `pi` in one multi-image prompt.
 - Telegram **positions** are passed to pi as text with latitude, longitude and
   an OpenStreetMap link. This also handles zero/negative coordinates. Only the
@@ -198,8 +194,25 @@ User TG → herald → herald-pi-bridge → pi -p "…" → herald → User TG
   messages, including after `/new` or a restart. There is no automatic deletion:
   remove unneeded attachments manually to reclaim disk space and personal data.
   Failed or oversized downloads return an explicit error instead of being ignored.
-- pi runs **on demand** (one process per message), with inbound messages queued
-  and processed sequentially; only herald runs continuously.
+- Pi stays **alive but idle between messages**, without model calls while waiting.
+  The same runtime retains extension state, such as a browser awaiting human 2FA.
+  Inbound prompts remain sequential; an idle runtime is not reported as busy.
+- Extension input/confirmation/selection dialogs are forwarded immediately to
+  Telegram with a unique `/answer <token> <response>` command. Only a matching,
+  same-chat reply can answer a live dialog (`/answer <token> /cancel` cancels it).
+  Earlier/unrelated messages remain queued as normal prompts, including after
+  a dialog expires. Dialog replies are not sent as additional model prompts.
+- `/new`, `/continue`, `/reload` and service shutdown close the old runtime
+  gracefully. Browser extension cleanup is retained. A crash reports failure
+  without automatically replaying a potentially consequential prompt; the next
+  user message starts a new runtime. Session files do not restore a live browser.
+- Cloud browser timeouts and billing are independent of Pi's idle lifetime.
+  After updating, copy `deploy/herald-pi-bridge.service` to
+  `~/.config/systemd/user/` and run `systemctl --user daemon-reload` so systemd
+  signals only the bridge initially (`KillMode=mixed`). Then use `/reload` or
+  restart the service to activate the code. The worker is the sole owner of Pi's
+  graceful EOF shutdown and drains stdout during its 30-second cleanup window.
+  Do not reload while a browser is awaiting human input.
 
 ```bash
 herald serve &           # daemon must be running first
@@ -235,4 +248,5 @@ print(s.recv(4096))
 
 ```bash
 go test ./...
+python3 -B bin/test-herald-pi-rpc.py
 ```

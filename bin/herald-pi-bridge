@@ -17,8 +17,8 @@
 #   HERALD_PI_VOICE_LANG   whisper language (default: auto)
 #   HERALD_PI_PARSE_MODE   Telegram format for pi replies (default: HTML uses rich messages; empty disables)
 #
-# Telegram photos use @image arguments; documents persist under $S/attachments
-# and reach pi as local paths (PDFs are not supported by pi's @file input).
+# Telegram photos use RPC image blocks; documents persist under $S/attachments
+# and reach pi as local paths. Pi stays alive between messages.
 set -uo pipefail
 
 # systemd user services start with a minimal PATH that omits the herald binary
@@ -214,22 +214,6 @@ set_active_session_id() {
   printf '%s\n' "$session_id" > "$ACTIVE_SESSION_FILE"
 }
 
-refresh_active_session_id_after_run() {
-  local previous_session_id="$1"
-  local previous_session_file="$2"
-  local session_file session_id
-
-  session_file="$(latest_session_file)"
-  [[ -n "$session_file" ]] || return 0
-  if [[ -z "$previous_session_id" && "$session_file" == "$previous_session_file" ]]; then
-    return 0
-  fi
-
-  session_id="$(session_id_from_file "$session_file")"
-  [[ -n "$session_id" ]] || return 0
-  set_active_session_id "$session_id"
-}
-
 html_escape() {
   python3 -c 'import html, sys; print(html.escape(sys.stdin.read(), quote=False), end="")'
 }
@@ -252,8 +236,8 @@ if [[ -z "$QUEUE_DIR" || "$QUEUE_DIR" == "/" ]]; then
   exit 1
 fi
 mkdir -p "$QUEUE_DIR"
-find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 \( -name 'task-*' -o -name '.task-*' -o -name generation \) -exec rm -rf {} + 2>/dev/null || true
-rm -f "$RUN_PID_FILE"
+find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 \( -name 'task-*' -o -name '.task-*' -o -name generation -o -name stopped-generation \) -exec rm -rf {} + 2>/dev/null || true
+rm -f "$RUN_PID_FILE" "$RUN_PID_FILE.busy"
 printf '0\n' > "$QUEUE_DIR/generation"
 
 current_generation() {
@@ -266,23 +250,24 @@ bump_generation() {
   printf '%s\n' "$generation" > "$QUEUE_DIR/generation"
 }
 
-pi_is_running() {
-  [[ -f "$RUN_PID_FILE" ]] && kill -0 "$(cat "$RUN_PID_FILE")" 2>/dev/null
-}
-
 stop_current_pi() {
-  local pid
-  if ! pi_is_running; then
-    rm -f "$RUN_PID_FILE"
-    return
+  local generation pid
+  generation="$(current_generation)"
+  # The worker owns EOF and cleanup. Never also signal Pi: Pi 1.4 treats a
+  # second shutdown request as an immediate exit, interrupting browser cleanup.
+  for _ in {1..350}; do
+    if [[ ! -f "$RUN_PID_FILE" && "$(head -n 1 "$QUEUE_DIR/stopped-generation" 2>/dev/null)" == "$generation" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "herald-pi-bridge: worker stop timed out; Cloud browser may remain billable" >&2
+  if [[ -f "$RUN_PID_FILE" ]]; then
+    pid="$(cat "$RUN_PID_FILE")"
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    rm -f "$RUN_PID_FILE" "$RUN_PID_FILE.busy"
   fi
-  pid="$(cat "$RUN_PID_FILE")"
-  pkill -TERM -P "$pid" 2>/dev/null || true
-  kill -TERM "$pid" 2>/dev/null || true
-  sleep 0.2
-  pkill -KILL -P "$pid" 2>/dev/null || true
-  kill -KILL "$pid" 2>/dev/null || true
-  rm -f "$RUN_PID_FILE"
+  return 1
 }
 
 clear_pending_tasks() {
@@ -293,82 +278,13 @@ next_task_dir() {
   find "$QUEUE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'task-*' 2>/dev/null | sort | head -n 1
 }
 
-run_pi_task() {
-  local task_dir="$1"
-  local chat_id prompt task_generation out reply rc pi_pid session_id session_file_before
-  local tmp_images=()
-  local pi_args=(--session-dir "$S")
+PI_SYSTEM_PROMPT="Tu communiques via un bot Telegram. Utilise le HTML simplifié compatible avec Telegram pour formater toutes tes réponses ; n’utilise pas Markdown.
 
-  if [[ ! -f "$task_dir/chat_id" || ! -f "$task_dir/prompt" || ! -f "$task_dir/generation" ]]; then
-    rm -rf "$task_dir"
-    return
-  fi
-
-  chat_id="$(cat "$task_dir/chat_id")"
-  prompt="$(cat "$task_dir/prompt")"
-  task_generation="$(cat "$task_dir/generation")"
-  if [[ -f "$task_dir/images" ]]; then
-    local image_path
-    while IFS= read -r image_path; do
-      [[ -n "$image_path" ]] || continue
-      tmp_images+=("$image_path")
-    done < "$task_dir/images"
-  fi
-  if [[ "$task_generation" != "$(current_generation)" ]]; then
-    rm -f "${tmp_images[@]}"
-    rm -rf "$task_dir"
-    return
-  fi
-
-  out="$(mktemp /tmp/herald-pi-output-XXXXXX.log)"
-  session_file_before="$(latest_session_file)"
-  session_id="$(active_session_id)"
-  if [[ -n "$session_id" ]]; then
-    pi_args+=(--session "$session_id")
-  fi
-
-  if [[ ${#tmp_images[@]} -gt 0 ]]; then
-    local pi_files=()
-    local tmp_image
-    for tmp_image in "${tmp_images[@]}"; do
-      pi_files+=("@$tmp_image")
-    done
-    (cd "$W" && printf '%s' "$prompt" | pi "${pi_args[@]}" -p "${pi_files[@]}" >"$out" 2>&1) &
-    pi_pid=$!
-  else
-    (cd "$W" && printf '%s' "$prompt" | pi "${pi_args[@]}" -p >"$out" 2>&1) &
-    pi_pid=$!
-  fi
-
-  printf '%s\n' "$pi_pid" > "$RUN_PID_FILE"
-  if [[ "$task_generation" != "$(current_generation)" ]]; then
-    pkill -TERM -P "$pi_pid" 2>/dev/null || true
-    kill -TERM "$pi_pid" 2>/dev/null || true
-    wait "$pi_pid" 2>/dev/null || true
-    rm -f "$RUN_PID_FILE" "${tmp_images[@]}" "$out"
-    rm -rf "$task_dir"
-    return
-  fi
-
-  wait "$pi_pid"
-  rc=$?
-  rm -f "$RUN_PID_FILE" "${tmp_images[@]}"
-
-  if [[ "$task_generation" == "$(current_generation)" ]]; then
-    refresh_active_session_id_after_run "$session_id" "$session_file_before"
-    reply="$(cat "$out")"
-    [[ -n "$reply" ]] || reply="(pi: réponse vide)"
-    if [[ $rc -ne 0 ]]; then
-      reply="⚠️ pi exited with code $rc
-
-$reply"
-    fi
-    send_pi_reply "$chat_id" "$reply"
-  fi
-
-  rm -f "$out"
-  rm -rf "$task_dir"
-}
+Mémoire Cognee :
+- Consulte Cognee avant de répondre lorsque la demande concerne l’utilisateur personnellement (profil, préférences, projets, décisions, historique), ou lorsque des informations de contexte non précisées dans la demande pourraient être utiles. Recherche ce contexte avant de faire des suppositions ou de demander à l’utilisateur de le répéter.
+- Maintiens Cognee à jour : enregistre les nouvelles informations durables explicitement communiquées par l’utilisateur, ses préférences et décisions, et corrige les informations devenues obsolètes. Consulte les souvenirs pertinents avant de les mettre à jour pour éviter les doublons ; les corrections explicites les plus récentes de l’utilisateur priment.
+- Distingue les faits confirmés des déductions et des informations anciennes ; mémorise uniquement le contexte utile, jamais les mots de passe, jetons ou autres secrets. Respecte toute demande de ne pas mémoriser une information ou de l’oublier.
+- Si Cognee est indisponible, indique cette limite lorsqu’elle affecte la réponse ; affirme avoir consulté ou mis à jour la mémoire uniquement après une opération réussie."
 
 enqueue_pi_reply() {
   local chat_id="$1"
@@ -378,7 +294,7 @@ enqueue_pi_reply() {
   local task_dir task_tmp task_id was_busy tmp_image
 
   was_busy=0
-  if pi_is_running || [[ -n "$(next_task_dir)" ]]; then
+  if [[ -f "$RUN_PID_FILE.busy" ]] || [[ -n "$(next_task_dir)" ]]; then
     was_busy=1
   fi
 
@@ -401,32 +317,33 @@ enqueue_pi_reply() {
   fi
 }
 
-process_queue() {
-  local task_dir
-  while true; do
-    task_dir="$(next_task_dir)"
-    if [[ -z "$task_dir" ]]; then
-      sleep 0.2
-      continue
-    fi
-    run_pi_task "$task_dir"
-  done
-}
-
-process_queue &
+python3 "$SCRIPT_DIR/herald-pi-rpc.py" "$QUEUE_DIR" "$S" "$W" \
+  "$RUN_PID_FILE" "$ACTIVE_SESSION_FILE" "$PI_PARSE_MODE" "$PI_SYSTEM_PROMPT" &
 queue_worker_pid=$!
 
 cleanup_done=0
 cleanup() {
+  local pid
   if [[ $cleanup_done -eq 1 ]]; then
     return
   fi
   cleanup_done=1
+  for pid in "${listener_pid:-}" "${receiver_pid:-}"; do
+    [[ -n "$pid" ]] || continue
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  if [[ -n "${listener_dir:-}" ]]; then
+    rm -rf "$listener_dir"
+  fi
   if [[ -n "${queue_worker_pid:-}" ]]; then
     kill "$queue_worker_pid" 2>/dev/null || true
     wait "$queue_worker_pid" 2>/dev/null || true
   fi
-  stop_current_pi
+  if [[ -f "$RUN_PID_FILE" ]]; then
+    stop_current_pi
+  fi
 }
 handle_shutdown() {
   cleanup
@@ -437,7 +354,15 @@ trap handle_shutdown INT TERM
 
 echo "herald-pi-bridge: listening (sessions: $S, queue: $QUEUE_DIR)" >&2
 
-herald recv --follow --json | while IFS= read -r raw; do
+# Keep the main shell in an interruptible wait: a foreground pipeline delays
+# its SIGTERM trap when systemd signals only the main PID (KillMode=mixed).
+listener_dir="$(mktemp -d /tmp/herald-pi-listener-XXXXXX)" || exit 1
+mkfifo "$listener_dir/input" || exit 1
+herald recv --follow --json > "$listener_dir/input" &
+receiver_pid=$!
+{
+trap - EXIT INT TERM
+while IFS= read -r raw; do
   [[ -n "$raw" ]] || continue
   eval "$(python3 - "$raw" <<'PY'
 import json, shlex, sys
@@ -565,7 +490,7 @@ Pour un PDF, utilise bash avec pdftotext pour lire le contenu ; pour un PDF scan
     rm -f "${tmp_images[@]}"
     bump_generation
     clear_pending_tasks
-    stop_current_pi
+    stop_current_pi || exit 1
     herald send --chat-id "$CHAT_ID" "♻️ Pi bridge rechargé. Les prochains messages relanceront pi avec les ressources à jour."
     if command -v systemctl >/dev/null 2>&1; then
       systemctl --user restart herald-pi-bridge >/dev/null 2>&1 &
@@ -576,7 +501,7 @@ Pour un PDF, utilise bash avec pdftotext pour lire le contenu ; pour un PDF scan
     rm -f "${tmp_images[@]}"
     bump_generation
     clear_pending_tasks
-    stop_current_pi
+    stop_current_pi || exit 1
     closed_session_id="$(active_session_id)"
     mark_new_session
     if [[ -n "$closed_session_id" ]]; then
@@ -610,10 +535,13 @@ Reprendre : <code>/continue $closed_session_id</code>"
     fi
     bump_generation
     clear_pending_tasks
-    stop_current_pi
+    stop_current_pi || exit 1
     set_active_session_id "$resolved_session_id"
     send_pi_reply "$CHAT_ID" "↩️ Conversation reprise : <code>$resolved_session_id</code>"
     continue
   fi
   enqueue_pi_reply "$CHAT_ID" "$prompt" "${tmp_images[@]}"
 done
+} < "$listener_dir/input" &
+listener_pid=$!
+wait "$listener_pid"
